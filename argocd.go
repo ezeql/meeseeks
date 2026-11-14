@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -124,10 +125,19 @@ type EnvironmentItem struct {
 	GitURL       string   `json:"git_url,omitempty"`
 }
 
-// apiError includes ArgoCD's response body so the real reason isn't lost.
+// argoError keeps the status code and ArgoCD's response body so the real reason isn't lost.
+type argoError struct {
+	Status int
+	Body   string
+}
+
+func (e *argoError) Error() string {
+	return fmt.Sprintf("ArgoCD API returned status %d: %s", e.Status, e.Body)
+}
+
 func apiError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return fmt.Errorf("ArgoCD API returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	return &argoError{Status: resp.StatusCode, Body: string(bytes.TrimSpace(body))}
 }
 
 func NewArgoCDClient(baseURL, token string) *ArgoCDClient {
@@ -172,10 +182,15 @@ func (c *ArgoCDClient) call(method, path string, in, out any) error {
 	return nil
 }
 
-// Exists reports whether ArgoCD has an Application with this name.
-// ArgoCD answers 403 rather than 404 for missing apps, so only 200 counts.
-func (c *ArgoCDClient) Exists(name string) bool {
-	return c.call("GET", "/api/v1/applications/"+name, nil, nil) == nil
+// Exists reports whether ArgoCD has an Application with this name. ArgoCD answers 403
+// rather than 404 for missing apps. Any other failure is an error, never "free".
+func (c *ArgoCDClient) Exists(name string) (bool, error) {
+	err := c.call("GET", "/api/v1/applications/"+name, nil, nil)
+	var ae *argoError
+	if errors.As(err, &ae) && (ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Refresh makes ArgoCD re-read Git now instead of on its next poll (~3 min).

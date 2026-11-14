@@ -158,7 +158,11 @@ func (g *GitOps) Create(req EnvironmentRequest) (string, error) {
 
 	// An existing app with this name (made outside the client repo, or the root app)
 	// would be adopted by the root app, and a later delete would cascade into it.
-	if req.Name == rootApp || g.argo.Exists(req.Name) {
+	exists, err := g.argo.Exists(req.Name)
+	if err != nil {
+		return "", fmt.Errorf("check name in ArgoCD: %w", err)
+	}
+	if exists || req.Name == rootApp {
 		return "", fmt.Errorf("name %q is already used by an ArgoCD application", req.Name)
 	}
 

@@ -108,3 +108,54 @@ func TestNewGitHubRepoRejectsNonGitHub(t *testing.T) {
 		}
 	}
 }
+
+func TestGitOpsCreateFailsClosedWhenArgoCDErrors(t *testing.T) {
+	files := map[string]string{}
+	gh := fakeGitHub(files)
+	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", 500)
+	}))
+	defer gh.Close()
+	defer argo.Close()
+
+	repo, _ := NewGitHubRepo("https://github.com/o/r", "main", "token")
+	repo.API = gh.URL
+	g := &GitOps{repo: repo, argo: NewArgoCDClient(argo.URL, "t")}
+
+	if _, err := g.Create(EnvironmentRequest{Name: "test", Branch: "main"}); err == nil {
+		t.Fatal("create must fail when the name can't be checked")
+	}
+	if len(files) != 0 {
+		t.Fatalf("nothing may be committed, got %v", files)
+	}
+}
+
+func TestListApplications(t *testing.T) {
+	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"items":[
+		  {"metadata":{"name":"legacy","labels":{"managed-by":"meeseeks"}}},
+		  {"metadata":{"name":"bad","labels":{"meeseeks/gitops":"true","env-type":"dev"}},
+		   "spec":{"sources":[{"targetRevision":"nope","path":"deploy/base"},{"targetRevision":"nope","path":"deploy/deps/redis"}]},
+		   "status":{"sync":{"status":"Unknown"},"health":{"status":"Healthy"},
+		     "conditions":[{"type":"ComparisonError","message":"Unable to resolve 'nope' to a commit SHA"}]}},
+		  {"metadata":{"name":"going","labels":{"meeseeks/gitops":"true"},"deletionTimestamp":"2026-01-01T00:00:00Z"},
+		   "status":{"health":{"status":"Healthy"}}}
+		]}`)
+	}))
+	defer argo.Close()
+
+	list, err := NewArgoCDClient(argo.URL, "t").ListApplications()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("only client-repo apps should be listed, got %+v", list.Items)
+	}
+	bad, going := list.Items[0], list.Items[1]
+	if !strings.Contains(bad.Message, "Unable to resolve") || bad.Branch != "nope" || len(bad.Dependencies) != 1 || bad.Dependencies[0] != "redis" {
+		t.Errorf("bad: %+v", bad)
+	}
+	if going.Status != "Deleting" {
+		t.Errorf("going: %+v", going)
+	}
+}

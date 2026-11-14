@@ -69,7 +69,7 @@ docker:
 # Run Docker container
 docker-run: docker
 	@echo "Running Docker container..."
-	@docker run -p $(PORT):$(PORT) \
+	@docker run --rm -p $(PORT):$(PORT) \
 		-e ARGOCD_URL=http://host.docker.internal:30080 \
 		-e ARGOCD_TOKEN=${ARGOCD_TOKEN} \
 		-e GITOPS_REPO -e GITOPS_BRANCH -e GITHUB_TOKEN \
