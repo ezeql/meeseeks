@@ -1,0 +1,13 @@
+# binaries
+/meeseeks
+tmp/
+
+# secrets
+password.txt
+terraform/argocd-token.txt
+
+# terraform state/cache (contains secrets)
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/tmp/

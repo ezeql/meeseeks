@@ -1,0 +1,7 @@
+# Base app for every environment. Meeseeks customizes it through ArgoCD's
+# kustomize options (replicas + a strategic-merge patch on Deployment "app").
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml

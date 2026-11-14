@@ -10,6 +10,7 @@ var (
 	nameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	cpuRegex  = regexp.MustCompile(`^\d+(\.\d+)?[m]?$`)
 	memRegex  = regexp.MustCompile(`^\d+(\.\d+)?[KMGT]i?$`)
+	envRegex  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 func ValidateEnvironmentRequest(req EnvironmentRequest) error {
@@ -43,6 +44,12 @@ func ValidateEnvironmentRequest(req EnvironmentRequest) error {
 
 	if err := validateEnvType(req.EnvType); err != nil {
 		return fmt.Errorf("invalid environment type: %w", err)
+	}
+
+	for name := range req.EnvVars {
+		if !envRegex.MatchString(name) {
+			return fmt.Errorf("invalid env var name %q: use letters, digits and underscores", name)
+		}
 	}
 
 	return nil
@@ -98,16 +105,15 @@ func validateMemory(memory string) error {
 }
 
 func validateDependencies(deps []string) error {
-	validDeps := map[string]bool{
-		"postgresql": true,
-		"redis":      true,
-		"mongodb":    true,
-	}
-
+	seen := map[string]bool{}
 	for _, dep := range deps {
-		if !validDeps[dep] {
+		if _, ok := dependencyEnv[dep]; !ok {
 			return fmt.Errorf("unsupported dependency: %s. Supported: postgresql, redis, mongodb", dep)
 		}
+		if seen[dep] {
+			return fmt.Errorf("duplicate dependency: %s", dep)
+		}
+		seen[dep] = true
 	}
 
 	return nil
@@ -119,13 +125,15 @@ func validateEnvType(envType string) error {
 	}
 
 	validTypes := map[string]bool{
-		"dev":     true,
-		"staging": true,
-		"prod":    true,
+		"development": true,
+		"staging":     true,
+		"testing":     true,
+		"dev":         true,
+		"prod":        true,
 	}
 
 	if !validTypes[envType] {
-		return fmt.Errorf("unsupported environment type: %s. Supported: dev, staging, prod", envType)
+		return fmt.Errorf("unsupported environment type: %s. Supported: development, staging, testing, dev, prod", envType)
 	}
 
 	return nil

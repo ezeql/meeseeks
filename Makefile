@@ -63,7 +63,7 @@ docker:
 docker-run: docker
 	@echo "Running Docker container..."
 	@docker run -p $(PORT):$(PORT) \
-		-e ARGOCD_URL=${ARGOCD_URL} \
+		-e ARGOCD_URL=http://host.docker.internal:30080 \
 		-e ARGOCD_TOKEN=${ARGOCD_TOKEN} \
 		-e PORT=$(PORT) \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
@@ -89,7 +89,7 @@ dev-mock:
 	@echo "🚀 Starting Meeseeks in Development Mode"
 	@echo "🌐 Frontend available at: http://localhost:22282"
 	@echo "💡 Running in mock mode - no real ArgoCD calls"
-	@DEV_MODE=true go run main.go argocd.go validation.go
+	@DEV_MODE=true go run .
 
 # Check if required environment variables are set
 check-env:

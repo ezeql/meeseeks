@@ -1,11 +1,12 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24.4-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 
 COPY *.go ./
+COPY static ./static
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o meeseeks .
 
 FROM alpine:latest
@@ -15,6 +16,6 @@ WORKDIR /root/
 
 COPY --from=builder /app/meeseeks .
 
-EXPOSE 8080
+EXPOSE 22282
 
 CMD ["./meeseeks"]

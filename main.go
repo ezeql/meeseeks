@@ -1,8 +1,10 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"log"
 	"net/http"
@@ -10,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 )
+
+//go:embed static
+var staticFS embed.FS
 
 type EnvironmentRequest struct {
 	Name         string            `json:"name"`
@@ -56,14 +61,8 @@ func (api *MeeseeksAPI) createEnvironment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	response := EnvironmentResponse{
-		ID:     envID,
-		Status: "creating",
-		URL:    fmt.Sprintf("https://%s.dev.example.com", req.Name),
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(EnvironmentResponse{ID: envID, Status: "creating", URL: envURL(req.Name)})
 }
 
 func (api *MeeseeksAPI) listEnvironments(w http.ResponseWriter, r *http.Request) {
@@ -77,235 +76,121 @@ func (api *MeeseeksAPI) listEnvironments(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(environments)
 }
 
-func (api *MeeseeksAPI) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
-	envID := r.URL.Path[len("/environments/"):]
-	if envID == "" {
-		http.Error(w, "Environment ID is required", http.StatusBadRequest)
-		return
-	}
-
-	if err := api.argoCDClient.DeleteApplication(envID); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to delete environment: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (api *MeeseeksAPI) serveHome(w http.ResponseWriter, r *http.Request) {
-	tmpl := `<!DOCTYPE html>
-<html>
+const homeHTML = `<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>Meeseeks - Environment Manager</title>
+    <title>Meeseeks</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
-        body { 
-            font-family: system-ui, -apple-system, sans-serif; 
-            max-width: 1200px; 
-            margin: 0 auto; 
-            padding: 20px;
-            background: #f5f5f5;
-        }
-        .container { 
-            background: white; 
-            padding: 30px; 
-            border-radius: 8px; 
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 { 
-            color: #333; 
-            margin-bottom: 30px;
-            text-align: center;
-        }
-        .form-group { 
-            margin-bottom: 15px; 
-        }
-        label { 
-            display: block; 
-            margin-bottom: 5px; 
-            font-weight: 500;
-        }
-        input, select, textarea { 
-            width: 100%; 
-            padding: 10px; 
-            border: 1px solid #ddd; 
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        button { 
-            background: #007bff; 
-            color: white; 
-            padding: 12px 24px; 
-            border: none; 
-            border-radius: 4px; 
-            cursor: pointer;
-            font-size: 14px;
-            margin-right: 10px;
-        }
-        button:hover { 
-            background: #0056b3; 
-        }
-        .delete-btn { 
-            background: #dc3545; 
-            padding: 6px 12px;
-            font-size: 12px;
-        }
-        .delete-btn:hover { 
-            background: #c82333; 
-        }
-        .environments { 
-            margin-top: 30px; 
-        }
-        .env-item { 
-            background: #f8f9fa; 
-            padding: 15px; 
-            margin-bottom: 10px; 
-            border-radius: 4px;
-            border-left: 4px solid #007bff;
-        }
-        .env-header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center;
-        }
-        .env-name { 
-            font-weight: bold; 
-            font-size: 16px;
-        }
-        .env-details { 
-            color: #666; 
-            font-size: 14px;
-            margin-top: 5px;
-        }
-        .form-row { 
-            display: grid; 
-            grid-template-columns: 1fr 1fr; 
-            gap: 15px;
-        }
-        .response { 
-            margin-top: 20px; 
-            padding: 15px; 
-            border-radius: 4px;
-        }
-        .success { 
-            background: #d4edda; 
-            color: #155724; 
-            border: 1px solid #c3e6cb;
-        }
-        .error { 
-            background: #f8d7da; 
-            color: #721c24; 
-            border: 1px solid #f5c6cb;
-        }
+        * { box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px 16px; background: #f4f6f8; color: #222; }
+        header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+        header img { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; }
+        header h1 { margin: 0; font-size: 24px; }
+        header p { margin: 4px 0 0; color: #666; }
+        .card { background: white; padding: 24px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 24px; }
+        h2 { margin-top: 0; font-size: 18px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+        label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+        input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ccd; border-radius: 4px; font: inherit; }
+        .checks label { display: inline-flex; align-items: center; gap: 6px; font-weight: normal; margin-right: 16px; }
+        .checks input { width: auto; }
+        .field { margin-top: 12px; }
+        button { background: #1f6feb; color: white; padding: 10px 20px; border: 0; border-radius: 4px; cursor: pointer; font: inherit; margin-top: 16px; }
+        button:hover { background: #1158c7; }
+        .htmx-request button[type=submit] { opacity: .6; }
+        .delete-btn { background: #d73a49; padding: 6px 12px; font-size: 13px; margin: 0; }
+        .delete-btn:hover { background: #b31d28; }
+        .env-item { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid #eee; }
+        .env-item:first-child { border-top: 0; }
+        .env-name { font-weight: 600; }
+        .env-details { color: #666; font-size: 13px; margin-top: 4px; }
+        .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #eee; }
+        .Healthy, .Synced { background: #dcfce7; color: #166534; }
+        .Progressing, .OutOfSync, .Deleting, .Unknown { background: #fef9c3; color: #854d0e; }
+        .Degraded, .Missing { background: #fee2e2; color: #991b1b; }
+        .response { margin-top: 16px; padding: 12px; border-radius: 4px; }
+        .success { background: #dcfce7; color: #166534; }
+        .error { background: #fee2e2; color: #991b1b; word-break: break-word; }
+        .hint { color: #888; font-size: 12px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🧪 Meeseeks Environment Manager</h1>
-        
-        <form hx-post="/environments" hx-target="#response" hx-trigger="submit">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="name">Environment Name:</label>
-                    <input type="text" id="name" name="name" required>
-                </div>
-                <div class="form-group">
-                    <label for="branch">Branch:</label>
-                    <input type="text" id="branch" name="branch" required>
-                </div>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="cpu">CPU:</label>
-                    <input type="text" id="cpu" name="cpu" value="100m" required>
-                </div>
-                <div class="form-group">
-                    <label for="memory">Memory:</label>
-                    <input type="text" id="memory" name="memory" value="256Mi" required>
-                </div>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="replicas">Replicas:</label>
-                    <input type="number" id="replicas" name="replicas" value="1" min="1" required>
-                </div>
-                <div class="form-group">
-                    <label for="env_type">Environment Type:</label>
-                    <select id="env_type" name="env_type" required>
-                        <option value="development">Development</option>
-                        <option value="staging">Staging</option>
-                        <option value="testing">Testing</option>
-                    </select>
-                </div>
-            </div>
-            
-            <div class="form-group">
-                <label for="dependencies">Dependencies (comma-separated):</label>
-                <input type="text" id="dependencies" name="dependencies" placeholder="postgresql,redis">
-            </div>
-            
-            <div class="form-group">
-                <label for="env_vars">Environment Variables (JSON format):</label>
-                <textarea id="env_vars" name="env_vars" rows="3" placeholder='{"KEY1": "value1", "KEY2": "value2"}'>{}</textarea>
-            </div>
-            
-            <button type="submit">Create Environment</button>
-            <button type="button" hx-get="/environments" hx-target="#environments">Refresh List</button>
-        </form>
-        
-        <div id="response"></div>
-        
-        <div class="environments">
-            <h2>Environments</h2>
-            <div id="environments" hx-get="/environments" hx-trigger="load">
-                Loading environments...
-            </div>
+    <header>
+        <img src="/static/meeseeks.jpeg" alt="">
+        <div>
+            <h1>Meeseeks</h1>
+            <p>Ephemeral environments on Kubernetes, deployed through ArgoCD.</p>
         </div>
+    </header>
+
+    <div class="card">
+        <h2>New environment</h2>
+        <form hx-post="/environments" hx-target="#response">
+            <div class="grid">
+                <div><label for="name">Name</label><input id="name" name="name" placeholder="my-feature" required pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?" title="lowercase letters, digits and dashes"></div>
+                <div><label for="branch">Branch</label><input id="branch" name="branch" value="main" required></div>
+                <div><label for="env_type">Type</label>
+                    <select id="env_type" name="env_type"><option>dev</option><option>staging</option><option>prod</option></select></div>
+            </div>
+            <div class="grid field">
+                <div><label for="cpu">CPU</label><input id="cpu" name="cpu" value="100m"></div>
+                <div><label for="memory">Memory</label><input id="memory" name="memory" value="128Mi"></div>
+                <div><label for="replicas">Replicas</label><input id="replicas" name="replicas" type="number" value="1" min="1" max="10"></div>
+            </div>
+            <div class="field checks">
+                <label style="display:block;font-weight:600">Dependencies</label>
+                <label><input type="checkbox" name="dependencies" value="postgresql"> PostgreSQL</label>
+                <label><input type="checkbox" name="dependencies" value="redis"> Redis</label>
+                <label><input type="checkbox" name="dependencies" value="mongodb"> MongoDB</label>
+            </div>
+            <div class="field">
+                <label for="env_vars">Environment variables</label>
+                <textarea id="env_vars" name="env_vars" rows="3" placeholder="LOG_LEVEL=debug&#10;FEATURE_X=true"></textarea>
+                <div class="hint">One KEY=value per line. Dependencies inject DATABASE_URL / REDIS_URL / MONGODB_URL.</div>
+            </div>
+            <button type="submit">Create environment</button>
+        </form>
+        <div id="response"></div>
+    </div>
+
+    <div class="card">
+        <h2>Environments</h2>
+        <div id="environments" hx-get="/environments" hx-trigger="load, every 5s, env-changed from:body">Loading…</div>
     </div>
 </body>
 </html>`
 
-	t, err := template.New("home").Parse(tmpl)
-	if err != nil {
-		http.Error(w, "Template error", http.StatusInternalServerError)
-		return
-	}
+func (api *MeeseeksAPI) serveHome(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, homeHTML)
+}
 
-	w.Header().Set("Content-Type", "text/html")
-	t.Execute(w, nil)
+func htmxError(w http.ResponseWriter, msg string, err error) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<div class="response error">%s: %s</div>`, msg, html.EscapeString(err.Error()))
 }
 
 func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<div class="response error">Error parsing form: %v</div>`, err)
+		htmxError(w, "Error parsing form", err)
 		return
 	}
 
-	// Parse dependencies
-	var dependencies []string
-	if deps := r.FormValue("dependencies"); deps != "" {
-		for _, dep := range strings.Split(deps, ",") {
-			if trimmed := strings.TrimSpace(dep); trimmed != "" {
-				dependencies = append(dependencies, trimmed)
-			}
+	envVars := map[string]string{}
+	for _, line := range strings.Split(r.FormValue("env_vars"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-	}
-
-	// Parse environment variables
-	var envVars map[string]string
-	envVarsStr := r.FormValue("env_vars")
-	if envVarsStr == "" {
-		envVarsStr = "{}"
-	}
-	if err := json.Unmarshal([]byte(envVarsStr), &envVars); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<div class="response error">Invalid environment variables JSON: %v</div>`, err)
-		return
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			htmxError(w, "Invalid environment variables", fmt.Errorf("%q is not KEY=value", line))
+			return
+		}
+		envVars[strings.TrimSpace(key)] = strings.TrimSpace(value)
 	}
 
 	req := EnvironmentRequest{
@@ -313,78 +198,64 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 		Branch:       r.FormValue("branch"),
 		CPU:          r.FormValue("cpu"),
 		Memory:       r.FormValue("memory"),
-		Replicas:     1,
-		Dependencies: dependencies,
+		Dependencies: r.Form["dependencies"],
 		EnvType:      r.FormValue("env_type"),
 		EnvVars:      envVars,
 	}
-
-	// Parse replicas
 	if replicas := r.FormValue("replicas"); replicas != "" {
-		if r, err := strconv.Atoi(replicas); err == nil {
-			req.Replicas = r
+		n, err := strconv.Atoi(replicas)
+		if err != nil {
+			htmxError(w, "Validation error", fmt.Errorf("replicas must be a number"))
+			return
 		}
+		req.Replicas = n
 	}
 
 	if err := ValidateEnvironmentRequest(req); err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<div class="response error">Validation error: %v</div>`, err)
+		htmxError(w, "Validation error", err)
 		return
 	}
 
-	envID, err := api.argoCDClient.CreateApplication(req)
-	if err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<div class="response error">Failed to create environment: %v</div>`, err)
+	if _, err := api.argoCDClient.CreateApplication(req); err != nil {
+		htmxError(w, "Failed to create environment", err)
 		return
 	}
 
-	response := EnvironmentResponse{
-		ID:     envID,
-		Status: "creating",
-		URL:    fmt.Sprintf("https://%s.dev.example.com", req.Name),
-	}
-
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<div class="response success">
-		<strong>Environment Created!</strong><br>
-		ID: %s<br>
-		Status: %s<br>
-		URL: <a href="%s" target="_blank">%s</a>
-	</div>`, response.ID, response.Status, response.URL, response.URL)
+	w.Header().Set("HX-Trigger", "env-changed") // refresh the list
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	url := html.EscapeString(envURL(req.Name))
+	fmt.Fprintf(w, `<div class="response success">Environment <strong>%s</strong> created. ArgoCD is syncing it; it will be at <a href="%s" target="_blank">%s</a></div>`,
+		html.EscapeString(req.Name), url, url)
 }
+
+var listTmpl = template.Must(template.New("list").Funcs(template.FuncMap{"join": strings.Join}).Parse(`
+{{- range .}}
+<div class="env-item">
+  <div>
+    <div class="env-name"><a href="{{.URL}}" target="_blank">{{.Name}}</a></div>
+    <div class="env-details">
+      <span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span>
+      <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span>
+      branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .Dependencies}} · {{join . ", "}}{{end}}
+    </div>
+  </div>
+  <button class="delete-btn" hx-delete="/environments/{{.Name}}" hx-target="closest .env-item" hx-swap="outerHTML"
+    hx-confirm="Delete environment {{.Name}}?">Delete</button>
+</div>
+{{- else}}
+<div class="hint">No environments yet.</div>
+{{- end}}`))
 
 func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Request) {
 	environments, err := api.argoCDClient.ListApplications()
 	if err != nil {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<div class="error">Failed to list environments: %v</div>`, err)
+		htmxError(w, "Failed to list environments", err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/html")
-
-	if len(environments.Items) == 0 {
-		fmt.Fprint(w, `<div>No environments found.</div>`)
-		return
-	}
-
-	for _, env := range environments.Items {
-		fmt.Fprintf(w, `
-		<div class="env-item">
-			<div class="env-header">
-				<div>
-					<div class="env-name">%s</div>
-					<div class="env-details">Status: %s</div>
-				</div>
-				<button class="delete-btn" 
-					hx-delete="/environments/%s" 
-					hx-target="closest .env-item"
-					hx-confirm="Are you sure you want to delete this environment?">
-					Delete
-				</button>
-			</div>
-		</div>`, env.Name, env.Status, env.Name)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := listTmpl.Execute(w, environments.Items); err != nil {
+		log.Printf("render list: %v", err)
 	}
 }
 
@@ -400,24 +271,9 @@ func (m *MockArgoCDClient) ListApplications() (EnvironmentList, error) {
 	log.Printf("Mock: Listing applications")
 	return EnvironmentList{
 		Items: []EnvironmentItem{
-			{
-				ID:     "test-env-1",
-				Name:   "test-env-1",
-				Status: "Healthy",
-				URL:    "https://test-env-1.dev.example.com",
-			},
-			{
-				ID:     "staging-app",
-				Name:   "staging-app",
-				Status: "Progressing",
-				URL:    "https://staging-app.dev.example.com",
-			},
-			{
-				ID:     "demo-service",
-				Name:   "demo-service",
-				Status: "Healthy",
-				URL:    "https://demo-service.dev.example.com",
-			},
+			{ID: "test-env-1", Name: "test-env-1", Status: "Healthy", Sync: "Synced", Branch: "main", EnvType: "dev", URL: envURL("test-env-1")},
+			{ID: "staging-app", Name: "staging-app", Status: "Progressing", Sync: "Synced", Branch: "main", EnvType: "staging", Dependencies: []string{"postgresql"}, URL: envURL("staging-app")},
+			{ID: "demo-service", Name: "demo-service", Status: "Healthy", Sync: "Synced", Branch: "demo", EnvType: "dev", Dependencies: []string{"redis", "mongodb"}, URL: envURL("demo-service")},
 		},
 	}, nil
 }
@@ -452,58 +308,51 @@ func main() {
 
 	// Frontend routes
 	mux.HandleFunc("/", api.serveHome)
+	mux.Handle("/static/", http.FileServerFS(staticFS))
 
-	// API routes - existing JSON endpoints
+	// API routes: JSON by default, HTML fragments for HTMX requests
 	mux.HandleFunc("/environments", func(w http.ResponseWriter, r *http.Request) {
-		// Check if request is from HTMX
-		if r.Header.Get("HX-Request") == "true" {
-			switch r.Method {
-			case http.MethodPost:
-				api.createEnvironmentHTMX(w, r)
-			case http.MethodGet:
-				api.listEnvironmentsHTMX(w, r)
-			default:
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			}
-		} else {
-			// Original JSON API
-			switch r.Method {
-			case http.MethodPost:
-				api.createEnvironment(w, r)
-			case http.MethodGet:
-				api.listEnvironments(w, r)
-			default:
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			}
+		htmx := r.Header.Get("HX-Request") == "true"
+		switch {
+		case r.Method == http.MethodPost && htmx:
+			api.createEnvironmentHTMX(w, r)
+		case r.Method == http.MethodGet && htmx:
+			api.listEnvironmentsHTMX(w, r)
+		case r.Method == http.MethodPost:
+			api.createEnvironment(w, r)
+		case r.Method == http.MethodGet:
+			api.listEnvironments(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 
 	mux.HandleFunc("/environments/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			envID := r.URL.Path[len("/environments/"):]
-			if envID == "" {
-				http.Error(w, "Environment ID is required", http.StatusBadRequest)
-				return
-			}
-
-			if err := api.argoCDClient.DeleteApplication(envID); err != nil {
-				if r.Header.Get("HX-Request") == "true" {
-					w.Header().Set("Content-Type", "text/html")
-					fmt.Fprintf(w, `<div class="error">Failed to delete environment: %v</div>`, err)
-				} else {
-					http.Error(w, fmt.Sprintf("Failed to delete environment: %v", err), http.StatusInternalServerError)
-				}
-				return
-			}
-
-			if r.Header.Get("HX-Request") == "true" {
-				// Return empty content to remove the element from DOM
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNoContent)
-			}
-		} else {
+		if r.Method != http.MethodDelete {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		envID := r.URL.Path[len("/environments/"):]
+		if envID == "" {
+			http.Error(w, "Environment ID is required", http.StatusBadRequest)
+			return
+		}
+
+		htmx := r.Header.Get("HX-Request") == "true"
+		if err := api.argoCDClient.DeleteApplication(envID); err != nil {
+			if htmx {
+				htmxError(w, "Failed to delete environment", err)
+			} else {
+				http.Error(w, fmt.Sprintf("Failed to delete environment: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		if htmx {
+			w.WriteHeader(http.StatusOK) // empty body: HTMX removes the row
+		} else {
+			w.WriteHeader(http.StatusNoContent)
 		}
 	})
 

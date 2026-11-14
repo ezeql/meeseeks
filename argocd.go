@@ -4,9 +4,29 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 )
+
+// Manifests live in this repo: deploy/base is the app, deploy/deps/<name> each dependency.
+const manifestsRepo = "https://github.com/ezeql/meeseeks"
+
+// Supported dependencies and the env var injected into the app so it can reach each one.
+var dependencyEnv = map[string][2]string{
+	"postgresql": {"DATABASE_URL", "postgres://postgres:meeseeks@postgresql:5432/app"},
+	"redis":      {"REDIS_URL", "redis://redis:6379"},
+	"mongodb":    {"MONGODB_URL", "mongodb://mongodb:27017"},
+}
+
+// envURL is the environment's in-cluster Service. OrbStack makes *.svc.cluster.local
+// reachable from the Mac; on other clusters use kubectl port-forward.
+func envURL(name string) string {
+	return "http://app.env-" + name + ".svc.cluster.local"
+}
 
 type ArgoCDClient struct {
 	baseURL string
@@ -28,44 +48,37 @@ type ArgoCDApplicationMetadata struct {
 }
 
 type ArgoCDApplicationSpec struct {
-	Project     string                  `json:"project"`
-	Source      ArgoCDApplicationSource `json:"source"`
-	Destination ArgoCDDestination       `json:"destination"`
-	SyncPolicy  *ArgoCDSyncPolicy       `json:"syncPolicy,omitempty"`
+	Project     string                    `json:"project"`
+	Sources     []ArgoCDApplicationSource `json:"sources"`
+	Destination ArgoCDDestination         `json:"destination"`
+	SyncPolicy  *ArgoCDSyncPolicy         `json:"syncPolicy,omitempty"`
 }
 
 type ArgoCDApplicationSource struct {
-	RepoURL        string                 `json:"repoURL"`
-	TargetRevision string                 `json:"targetRevision"`
-	Path           string                 `json:"path"`
-	Kustomize      *ArgoCDKustomizeConfig `json:"kustomize,omitempty"`
-	Directory      *ArgoCDDirectory       `json:"directory,omitempty"`
+	RepoURL        string           `json:"repoURL"`
+	TargetRevision string           `json:"targetRevision"`
+	Path           string           `json:"path"`
+	Kustomize      *ArgoCDKustomize `json:"kustomize,omitempty"`
 }
 
-type ArgoCDDirectory struct {
-	Recurse bool `json:"recurse,omitempty"`
+type ArgoCDKustomize struct {
+	Replicas []ArgoCDReplica        `json:"replicas,omitempty"`
+	Patches  []ArgoCDKustomizePatch `json:"patches,omitempty"`
 }
 
-type ArgoCDKustomizeConfig struct {
-	Images          []string               `json:"images,omitempty"`
-	Patches         []ArgoCDKustomizePatch `json:"patches,omitempty"`
-	PatchesJSON6902 []ArgoCDJsonPatch      `json:"patchesJson6902,omitempty"`
+type ArgoCDReplica struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 type ArgoCDKustomizePatch struct {
-	Patch  string `json:"patch"`
-	Target struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
-	} `json:"target"`
+	Patch  string       `json:"patch"`
+	Target ArgoCDTarget `json:"target"`
 }
 
-type ArgoCDJsonPatch struct {
-	Target struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
-	} `json:"target"`
-	Patch string `json:"patch"`
+type ArgoCDTarget struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
 }
 
 type ArgoCDDestination struct {
@@ -88,10 +101,20 @@ type EnvironmentList struct {
 }
 
 type EnvironmentItem struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	URL    string `json:"url"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Status       string   `json:"status"` // ArgoCD health, or "Deleting"
+	Sync         string   `json:"sync"`
+	Branch       string   `json:"branch"`
+	EnvType      string   `json:"env_type"`
+	Dependencies []string `json:"dependencies"`
+	URL          string   `json:"url"`
+}
+
+// apiError includes ArgoCD's response body so the real reason isn't lost.
+func apiError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("ArgoCD API returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 }
 
 func NewArgoCDClient(baseURL, token string) *ArgoCDClient {
@@ -127,7 +150,7 @@ func (c *ArgoCDClient) CreateApplication(req EnvironmentRequest) (string, error)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("ArgoCD API returned status %d", resp.StatusCode)
+		return "", apiError(resp)
 	}
 
 	return req.Name, nil
@@ -148,16 +171,28 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return EnvironmentList{}, fmt.Errorf("ArgoCD API returned status %d", resp.StatusCode)
+		return EnvironmentList{}, apiError(resp)
 	}
 
+	type rawSource struct {
+		TargetRevision string `json:"targetRevision"`
+		Path           string `json:"path"`
+	}
 	var rawApps struct {
 		Items []struct {
 			Metadata struct {
-				Name   string            `json:"name"`
-				Labels map[string]string `json:"labels"`
+				Name              string            `json:"name"`
+				Labels            map[string]string `json:"labels"`
+				DeletionTimestamp string            `json:"deletionTimestamp"`
 			} `json:"metadata"`
+			Spec struct {
+				Source  *rawSource  `json:"source"`
+				Sources []rawSource `json:"sources"`
+			} `json:"spec"`
 			Status struct {
+				Sync struct {
+					Status string `json:"status"`
+				} `json:"sync"`
 				Health struct {
 					Status string `json:"status"`
 				} `json:"health"`
@@ -169,16 +204,35 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 		return EnvironmentList{}, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	var environments []EnvironmentItem
+	environments := []EnvironmentItem{}
 	for _, app := range rawApps.Items {
-		if app.Metadata.Labels["managed-by"] == "meeseeks" {
-			environments = append(environments, EnvironmentItem{
-				ID:     app.Metadata.Name,
-				Name:   app.Metadata.Name,
-				Status: app.Status.Health.Status,
-				URL:    fmt.Sprintf("https://%s.dev.example.com", app.Metadata.Name),
-			})
+		if app.Metadata.Labels["managed-by"] != "meeseeks" {
+			continue
 		}
+		sources := app.Spec.Sources
+		if app.Spec.Source != nil { // apps created before multi-source
+			sources = append([]rawSource{*app.Spec.Source}, sources...)
+		}
+		env := EnvironmentItem{
+			ID:      app.Metadata.Name,
+			Name:    app.Metadata.Name,
+			Status:  app.Status.Health.Status,
+			Sync:    app.Status.Sync.Status,
+			EnvType: app.Metadata.Labels["env-type"],
+			URL:     envURL(app.Metadata.Name),
+		}
+		if app.Metadata.DeletionTimestamp != "" {
+			env.Status = "Deleting"
+		}
+		if len(sources) > 0 {
+			env.Branch = sources[0].TargetRevision
+		}
+		for _, s := range sources {
+			if dep, ok := strings.CutPrefix(s.Path, "deploy/deps/"); ok {
+				env.Dependencies = append(env.Dependencies, dep)
+			}
+		}
+		environments = append(environments, env)
 	}
 
 	return EnvironmentList{Items: environments}, nil
@@ -199,14 +253,30 @@ func (c *ArgoCDClient) DeleteApplication(name string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("ArgoCD API returned status %d", resp.StatusCode)
+		return apiError(resp)
 	}
 
 	return nil
 }
 
+// buildApplication makes one multi-source Application: the app (kustomize, customized
+// per request) plus a plain directory source per dependency, all from the same branch.
 func (c *ArgoCDClient) buildApplication(req EnvironmentRequest) ArgoCDApplication {
-	app := ArgoCDApplication{
+	sources := []ArgoCDApplicationSource{{
+		RepoURL:        manifestsRepo,
+		TargetRevision: req.Branch,
+		Path:           "deploy/base",
+		Kustomize:      buildKustomize(req),
+	}}
+	for _, dep := range req.Dependencies {
+		sources = append(sources, ArgoCDApplicationSource{
+			RepoURL:        manifestsRepo,
+			TargetRevision: req.Branch,
+			Path:           "deploy/deps/" + dep,
+		})
+	}
+
+	return ArgoCDApplication{
 		APIVersion: "argoproj.io/v1alpha1",
 		Kind:       "Application",
 		Metadata: ArgoCDApplicationMetadata{
@@ -219,11 +289,7 @@ func (c *ArgoCDClient) buildApplication(req EnvironmentRequest) ArgoCDApplicatio
 		},
 		Spec: ArgoCDApplicationSpec{
 			Project: "default",
-			Source: ArgoCDApplicationSource{
-				RepoURL:        "https://github.com/mateothegreat/k8-byexamples-nginx",
-				TargetRevision: "master",
-				Path:           "manifests",
-			},
+			Sources: sources,
 			Destination: ArgoCDDestination{
 				Server:    "https://kubernetes.default.svc",
 				Namespace: fmt.Sprintf("env-%s", req.Name),
@@ -235,213 +301,67 @@ func (c *ArgoCDClient) buildApplication(req EnvironmentRequest) ArgoCDApplicatio
 				},
 				SyncOptions: []string{
 					"CreateNamespace=true",
+					"PrunePropagationPolicy=foreground",
+					"PruneLast=true",
 				},
 			},
 		},
 	}
-
-	return app
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func defaultIfEmpty(value, defaultValue string) string {
-	if value == "" {
-		return defaultValue
-	}
-	return value
-}
-
-func (c *ArgoCDClient) buildKustomizeConfig(req EnvironmentRequest) *ArgoCDKustomizeConfig {
-	config := &ArgoCDKustomizeConfig{
-		Images: []string{
-			fmt.Sprintf("app=your-app:%s", req.Branch),
-		},
-	}
-
-	if req.CPU != "" || req.Memory != "" || req.Replicas > 0 {
-		resourcePatch := c.buildResourcePatch(req)
-		config.Patches = append(config.Patches, resourcePatch)
-	}
-
-	for _, dep := range req.Dependencies {
-		depPatch := c.buildDependencyPatch(dep)
-		config.Patches = append(config.Patches, depPatch)
-	}
-
-	if len(req.EnvVars) > 0 {
-		envPatch := c.buildEnvVarsPatch(req.EnvVars)
-		config.Patches = append(config.Patches, envPatch)
-	}
-
-	return config
-}
-
-func (c *ArgoCDClient) buildResourcePatch(req EnvironmentRequest) ArgoCDKustomizePatch {
-	patch := `
-- op: replace
-  path: /spec/template/spec/containers/0/resources
-  value:
-    requests:`
-
-	if req.CPU != "" {
-		patch += fmt.Sprintf(`
-      cpu: "%s"`, req.CPU)
-	}
-	if req.Memory != "" {
-		patch += fmt.Sprintf(`
-      memory: "%s"`, req.Memory)
-	}
-
-	patch += `
-    limits:`
-
-	if req.CPU != "" {
-		patch += fmt.Sprintf(`
-      cpu: "%s"`, req.CPU)
-	}
-	if req.Memory != "" {
-		patch += fmt.Sprintf(`
-      memory: "%s"`, req.Memory)
-	}
-
+// buildKustomize turns the request into ArgoCD kustomize options: a replica count and
+// one strategic-merge patch on Deployment "app" for resources and env vars.
+// Strategic merge (unlike JSON patch) works whether or not the base sets those fields.
+func buildKustomize(req EnvironmentRequest) *ArgoCDKustomize {
+	k := &ArgoCDKustomize{}
 	if req.Replicas > 0 {
-		patch += fmt.Sprintf(`
-- op: replace
-  path: /spec/replicas
-  value: %d`, req.Replicas)
+		k.Replicas = []ArgoCDReplica{{Name: "app", Count: req.Replicas}}
 	}
 
-	return ArgoCDKustomizePatch{
-		Patch: patch,
-		Target: struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		}{
-			Kind: "Deployment",
-			Name: "app",
-		},
+	container := map[string]any{"name": "app"}
+
+	resources := map[string]string{}
+	if req.CPU != "" {
+		resources["cpu"] = req.CPU
 	}
-}
-
-func (c *ArgoCDClient) buildDependencyPatch(dependency string) ArgoCDKustomizePatch {
-	var patch string
-
-	switch dependency {
-	case "postgresql":
-		patch = `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: postgresql
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgresql
-  template:
-    metadata:
-      labels:
-        app: postgresql
-    spec:
-      containers:
-      - name: postgresql
-        image: postgres:14
-        env:
-        - name: POSTGRES_DB
-          value: myapp
-        - name: POSTGRES_USER
-          value: user
-        - name: POSTGRES_PASSWORD
-          value: password
-        ports:
-        - containerPort: 5432`
-	case "redis":
-		patch = `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redis
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redis
-  template:
-    metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-      - name: redis
-        image: redis:7
-        ports:
-        - containerPort: 6379`
-	case "mongodb":
-		patch = `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mongodb
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mongodb
-  template:
-    metadata:
-      labels:
-        app: mongodb
-    spec:
-      containers:
-      - name: mongodb
-        image: mongo:6
-        env:
-        - name: MONGO_INITDB_ROOT_USERNAME
-          value: root
-        - name: MONGO_INITDB_ROOT_PASSWORD
-          value: password
-        ports:
-        - containerPort: 27017`
+	if req.Memory != "" {
+		resources["memory"] = req.Memory
+	}
+	if len(resources) > 0 {
+		container["resources"] = map[string]any{"requests": resources, "limits": resources}
 	}
 
-	return ArgoCDKustomizePatch{
-		Patch: patch,
-		Target: struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		}{
-			Kind: "Deployment",
-			Name: dependency,
-		},
+	vars := map[string]string{}
+	for _, dep := range req.Dependencies {
+		kv := dependencyEnv[dep]
+		vars[kv[0]] = kv[1]
 	}
-}
-
-func (c *ArgoCDClient) buildEnvVarsPatch(envVars map[string]string) ArgoCDKustomizePatch {
-	patch := `
-- op: add
-  path: /spec/template/spec/containers/0/env
-  value:`
-
-	for key, value := range envVars {
-		patch += fmt.Sprintf(`
-  - name: %s
-    value: "%s"`, key, value)
+	maps.Copy(vars, req.EnvVars) // user values override dependency defaults
+	if len(vars) > 0 {
+		var env []map[string]string
+		for _, name := range slices.Sorted(maps.Keys(vars)) {
+			env = append(env, map[string]string{"name": name, "value": vars[name]})
+		}
+		container["env"] = env
 	}
 
-	return ArgoCDKustomizePatch{
-		Patch: patch,
-		Target: struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		}{
-			Kind: "Deployment",
-			Name: "app",
-		},
+	if len(container) > 1 {
+		patch, _ := json.Marshal(map[string]any{
+			"apiVersion": "apps/v1",
+			"kind":       "Deployment",
+			"metadata":   map[string]string{"name": "app"},
+			"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"containers": []any{container},
+			}}},
+		})
+		k.Patches = []ArgoCDKustomizePatch{{
+			Patch:  string(patch),
+			Target: ArgoCDTarget{Kind: "Deployment", Name: "app"},
+		}}
 	}
+
+	if k.Replicas == nil && k.Patches == nil {
+		return nil
+	}
+	return k
 }

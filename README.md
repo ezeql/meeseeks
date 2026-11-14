@@ -1,95 +1,70 @@
-# Meeseeks - Dynamic Development Environments
+# Meeseeks
 
-A REST API for creating dynamic development environments using ArgoCD and Kubernetes.
+Ephemeral, customizable environments on Kubernetes through a small Go API and web UI.
+Each environment is an ArgoCD `Application`, so every environment is GitOps-managed:
+ArgoCD renders the manifests from Git, applies them, and keeps them in sync.
 
-## Features
+```
+UI / curl ──► Meeseeks (Go) ──► ArgoCD API ──► Application ──► Git (deploy/) ──► Kubernetes
+```
 
-- **Branch deployment** - Deploy any Git branch
-- **Resource customization** - Configure CPU, memory, and replicas
-- **Service dependencies** - Add PostgreSQL, Redis, MongoDB
-- **Environment types** - Dev, staging, prod-like configurations
-- **GitOps integration** - Uses ArgoCD for deployment management
+![UI](docs/ui.png)
 
-## API Endpoints
+## How a request becomes an environment
 
-### Create Environment
+`POST /environments` creates one multi-source ArgoCD Application in namespace `env-<name>`:
+
+| Request field | What Meeseeks generates |
+|---|---|
+| `branch` | `targetRevision` of every source (deploy any branch of this repo's manifests) |
+| `cpu`, `memory` | Strategic-merge patch on Deployment `app` (requests = limits) |
+| `replicas` | ArgoCD `kustomize.replicas` |
+| `env_vars` | Env vars in the same patch |
+| `dependencies` | One extra source per dependency (`deploy/deps/<name>`), plus `DATABASE_URL` / `REDIS_URL` / `MONGODB_URL` injected into the app |
+| `env_type` | `env-type` label (`dev`, `staging`, `prod`) |
+
+Manifests live in [`deploy/`](deploy): `base/` is the app (a tiny echo server that prints its pod name, so
+you can see replicas load-balance), `deps/` has PostgreSQL, Redis and MongoDB.
+
+## Run it locally (OrbStack)
+
+Requirements: [OrbStack](https://orbstack.dev) with Kubernetes enabled, Terraform, the `argocd` CLI, Go 1.24+.
+
 ```bash
-POST /environments
-Content-Type: application/json
+cd terraform && terraform init && terraform apply   # installs ArgoCD on :30080, writes argocd-token.txt
+cd .. && make run                                   # http://localhost:22282
+```
 
-{
-  "name": "my-feature",
-  "branch": "feature/new-api",
-  "cpu": "500m",
-  "memory": "1Gi",
-  "replicas": 2,
+Without a cluster, `make dev-mock` serves the UI with fake data.
+
+With OrbStack, each environment is reachable from the Mac at `http://app.env-<name>.svc.cluster.local`
+(the UI links to it). On other clusters use `kubectl port-forward -n env-<name> svc/app 8080:80`.
+
+## API
+
+```bash
+curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d '{
+  "name": "my-feature", "branch": "main", "env_type": "dev",
+  "cpu": "100m", "memory": "128Mi", "replicas": 2,
   "dependencies": ["postgresql", "redis"],
-  "env_type": "dev",
-  "env_vars": {
-    "DEBUG": "true",
-    "LOG_LEVEL": "debug"
-  }
-}
+  "env_vars": {"LOG_LEVEL": "debug"}
+}'
+curl localhost:22282/environments               # list, with sync/health status
+curl -X DELETE localhost:22282/environments/my-feature
 ```
 
-### List Environments
-```bash
-GET /environments
-```
+The same endpoints return HTML fragments when called by the UI (HTMX, `HX-Request: true`).
 
-### Delete Environment
-```bash
-DELETE /environments/{name}
-```
-
-## Configuration
-
-Set these environment variables:
-
-- `ARGOCD_URL` - ArgoCD server URL (default: http://localhost:8080)
-- `ARGOCD_TOKEN` - ArgoCD authentication token (required)
-- `PORT` - Server port (default: 8080)
-
-## Example Usage
+## Development
 
 ```bash
-# Create a new environment
-curl -X POST http://localhost:8080/environments \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my-test-env",
-    "branch": "main",
-    "cpu": "100m",
-    "memory": "256Mi",
-    "replicas": 1,
-    "dependencies": ["postgresql"],
-    "env_type": "dev"
-  }'
-
-# List all environments
-curl http://localhost:8080/environments
-
-# Delete an environment
-curl -X DELETE http://localhost:8080/environments/my-test-env
+make test        # unit tests
+make docker      # build the image
+make docker-run  # run it against the local ArgoCD
 ```
 
-## Docker
+## Known limits
 
-```bash
-# Build
-docker build -t meeseeks .
-
-# Run
-docker run -p 8080:8080 \
-  -e ARGOCD_URL=https://argocd.example.com \
-  -e ARGOCD_TOKEN=your-token \
-  meeseeks
-```
-
-## Architecture
-
-```
-Developer → HTTP API → Meeseeks → ArgoCD → Kubernetes
-```
-
-Meeseeks creates ArgoCD Applications that use Kustomize patches to customize base Kubernetes manifests for each environment.
+- Deleting an environment removes its resources, but ArgoCD leaves the `env-<name>` namespace behind.
+- `env_type` is only a label; it doesn't change sizing.
+- Dependencies use throwaway credentials and no persistent volumes. These environments are ephemeral.
