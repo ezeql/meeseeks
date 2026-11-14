@@ -1,0 +1,30 @@
+# Runs once per environment against its postgresql dependency. Meeseeks reads the
+# summary ("tps = ...", "latency average = ...") from the logs through ArgoCD.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgbench
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pgbench
+          # One client version for every server, so only the server differs.
+          image: postgres:18-alpine
+          env:
+            - name: PGHOST
+              value: postgresql
+            - name: PGUSER
+              value: postgres
+            - name: PGPASSWORD
+              value: meeseeks # throwaway dev credentials, same as deploy/deps/postgresql
+            - name: PGDATABASE
+              value: app
+          command: ["sh", "-c"]
+          args:
+            - |
+              until pg_isready -q; do sleep 1; done
+              pgbench -i -s 10 -q
+              pgbench -c 8 -j 2 -T 30

@@ -37,7 +37,7 @@ resource "helm_release" "argocd" {
   repository = "https://argoproj.github.io/argo-helm"
   chart      = "argo-cd"
   namespace  = kubernetes_namespace.argocd.metadata[0].name
-  version    = "5.51.6"
+  version    = "10.18.0" # Argo CD v3.6.1
 
   # Custom values for OrbStack/local development
   values = [
@@ -161,6 +161,12 @@ resource "kubernetes_secret" "argocd_secret" {
   }
 
   type = "Opaque"
+
+  lifecycle {
+    # Argo CD records issued API tokens here at runtime. Dropping the key on apply
+    # would invalidate the token Meeseeks uses.
+    ignore_changes = [data["admin.tokens"]]
+  }
 }
 
 # Generate ArgoCD API token

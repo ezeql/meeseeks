@@ -2,27 +2,25 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-var (
-	errExists   = errors.New("already exists")
-	errNotFound = errors.New("not found")
-)
-
-// GitHubRepo writes files to the client repo, one commit per call.
-// ponytail: GitHub Contents API only, one file per commit. For GitLab/Gitea or
-// multi-file commits, put a git library behind CreateFile/DeleteFile.
+// GitHubRepo commits to the client repo through GitHub's Git Data API, so one request
+// (one environment or a whole matrix group) is one atomic commit.
+// ponytail: GitHub only. For GitLab/Gitea, put a git library behind snapshot/commit.
 type GitHubRepo struct {
 	API    string // https://api.github.com; tests point it at a fake
 	Owner  string
@@ -50,37 +48,80 @@ func NewGitHubRepo(repoURL, branch, token string) (*GitHubRepo, error) {
 
 func (g *GitHubRepo) URL() string { return "https://github.com/" + g.Owner + "/" + g.Name }
 
-func (g *GitHubRepo) FileURL(path string) string { return g.URL() + "/blob/" + g.Branch + "/" + path }
+func (g *GitHubRepo) FileURL(p string) string { return g.URL() + "/blob/" + g.Branch + "/" + p }
 
-type commitResponse struct {
-	Commit struct {
-		HTMLURL string `json:"html_url"`
-	} `json:"commit"`
+// snapshot is the branch head and every file path in it.
+type snapshot struct {
+	head, tree string
+	paths      []string
 }
 
-// CreateFile commits a new file and returns the commit URL. errExists if it's there already.
-func (g *GitHubRepo) CreateFile(path string, content []byte, message string) (string, error) {
-	var out commitResponse
-	err := g.do("PUT", path, map[string]string{
-		"message": message, "branch": g.Branch, "content": base64.StdEncoding.EncodeToString(content),
-	}, &out)
-	return out.Commit.HTMLURL, err
-}
-
-// DeleteFile commits the removal of a file and returns the commit URL.
-func (g *GitHubRepo) DeleteFile(path, message string) (string, error) {
-	var file struct {
-		SHA string `json:"sha"`
+func (g *GitHubRepo) snapshot() (snapshot, error) {
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
 	}
-	if err := g.do("GET", path+"?ref="+url.QueryEscape(g.Branch), nil, &file); err != nil {
+	if err := g.do("GET", "git/ref/heads/"+g.Branch, nil, &ref); err != nil {
+		return snapshot{}, err
+	}
+	var commit struct {
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := g.do("GET", "git/commits/"+ref.Object.SHA, nil, &commit); err != nil {
+		return snapshot{}, err
+	}
+	// ponytail: ignores GitHub's "truncated" flag (>100k entries), far beyond an environments repo.
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		} `json:"tree"`
+	}
+	if err := g.do("GET", "git/trees/"+commit.Tree.SHA+"?recursive=1", nil, &tree); err != nil {
+		return snapshot{}, err
+	}
+	s := snapshot{head: ref.Object.SHA, tree: commit.Tree.SHA}
+	for _, e := range tree.Tree {
+		if e.Type == "blob" {
+			s.paths = append(s.paths, e.Path)
+		}
+	}
+	return s, nil
+}
+
+// commit writes changes (path → content, nil to delete) as one commit on top of s.
+// The branch update is a fast-forward, so a concurrent commit makes this fail instead of being overwritten.
+func (g *GitHubRepo) commit(s snapshot, message string, changes map[string]*string) (string, error) {
+	var entries []map[string]any
+	for _, p := range slices.Sorted(maps.Keys(changes)) {
+		e := map[string]any{"path": p, "mode": "100644", "type": "blob", "sha": nil}
+		if c := changes[p]; c != nil {
+			delete(e, "sha")
+			e["content"] = *c
+		}
+		entries = append(entries, e)
+	}
+
+	var tree, commit struct {
+		SHA     string `json:"sha"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := g.do("POST", "git/trees", map[string]any{"base_tree": s.tree, "tree": entries}, &tree); err != nil {
 		return "", err
 	}
-	var out commitResponse
-	err := g.do("DELETE", path, map[string]string{"message": message, "branch": g.Branch, "sha": file.SHA}, &out)
-	return out.Commit.HTMLURL, err
+	if err := g.do("POST", "git/commits", map[string]any{"message": message, "tree": tree.SHA, "parents": []string{s.head}}, &commit); err != nil {
+		return "", err
+	}
+	if err := g.do("PATCH", "git/refs/heads/"+g.Branch, map[string]any{"sha": commit.SHA}, nil); err != nil {
+		return "", fmt.Errorf("update %s (changed concurrently? try again): %w", g.Branch, err)
+	}
+	return commit.HTMLURL, nil
 }
 
-func (g *GitHubRepo) do(method, path string, in, out any) error {
+func (g *GitHubRepo) do(method, apiPath string, in, out any) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -89,7 +130,7 @@ func (g *GitHubRepo) do(method, path string, in, out any) error {
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, fmt.Sprintf("%s/repos/%s/%s/contents/%s", g.API, g.Owner, g.Name, path), body)
+	req, err := http.NewRequest(method, fmt.Sprintf("%s/repos/%s/%s/%s", g.API, g.Owner, g.Name, apiPath), body)
 	if err != nil {
 		return err
 	}
@@ -98,19 +139,13 @@ func (g *GitHubRepo) do(method, path string, in, out any) error {
 
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("GitHub %s %s: %w", method, path, err)
+		return fmt.Errorf("GitHub %s %s: %w", method, apiPath, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		switch {
-		case resp.StatusCode == http.StatusUnprocessableEntity && bytes.Contains(msg, []byte(`\"sha\"`)):
-			return errExists // PUT without sha: the file is already there
-		case resp.StatusCode == http.StatusNotFound:
-			return errNotFound
-		}
-		return fmt.Errorf("GitHub %s %s returned %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(msg))
+		return fmt.Errorf("GitHub %s %s returned %d: %s", method, apiPath, resp.StatusCode, bytes.TrimSpace(msg))
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -118,30 +153,66 @@ func (g *GitHubRepo) do(method, path string, in, out any) error {
 	return nil
 }
 
-// GitOps is the real backend: desired state is written to the client repo,
+// GitOps is the real backend: desired state is committed to the client repo,
 // ArgoCD reconciles it, and status is read back from ArgoCD.
+//
+// Layout: environments/<name>.json, and environments/<group>/<name>.json for matrix groups.
 type GitOps struct {
 	repo *GitHubRepo
 	argo *ArgoCDClient
-	mu   sync.Mutex // ponytail: one writer at a time; concurrent commits to one branch can conflict
+	mu   sync.Mutex // ponytail: one writer at a time; a second instance would rely on the fast-forward check
+
+	benchMu sync.Mutex
+	bench   map[string]BenchResult // finished pgbench results by environment; they never change
 }
 
-func envPath(name string) string { return "environments/" + name + ".json" }
+const readmePath = "environments/README.md"
 
 const environmentsReadme = `# Environments
 
 One ArgoCD Application per file, written by Meeseeks. ArgoCD syncs this directory
-through the root app ` + "`" + rootApp + "`" + ` (app-of-apps).
+through the root app ` + "`" + rootApp + "`" + ` (app-of-apps). Matrix groups get a subdirectory.
 
 This README also keeps the directory in Git when there are no environments.
 `
 
+func envFile(r EnvironmentRequest) string {
+	if r.Group != "" {
+		return "environments/" + r.Group + "/" + r.Name + ".json"
+	}
+	return "environments/" + r.Name + ".json"
+}
+
+// usedNames returns every environment and group name present in the repo.
+func usedNames(paths []string) map[string]bool {
+	used := map[string]bool{}
+	for _, p := range paths {
+		rel, ok := strings.CutPrefix(p, "environments/")
+		if !ok || !strings.HasSuffix(rel, ".json") {
+			continue
+		}
+		dir, file := path.Split(rel)
+		used[strings.TrimSuffix(file, ".json")] = true
+		if dir != "" {
+			used[strings.TrimSuffix(dir, "/")] = true
+		}
+	}
+	return used
+}
+
 // Bootstrap makes the client repo and ArgoCD ready. It is idempotent, so it runs on every start.
 func (g *GitOps) Bootstrap() error {
+	s, err := g.repo.snapshot()
+	if err != nil {
+		return fmt.Errorf("read client repo: %w", err)
+	}
 	// Git drops empty directories; without this file, deleting the last environment
 	// would remove environments/ and break the root app.
-	if _, err := g.repo.CreateFile("environments/README.md", []byte(environmentsReadme), "Add environments directory"); err != nil && !errors.Is(err, errExists) {
-		return fmt.Errorf("prepare client repo: %w", err)
+	if !slices.Contains(s.paths, readmePath) {
+		readme := environmentsReadme
+		if _, err := g.repo.commit(s, "Add environments directory", map[string]*string{readmePath: &readme}); err != nil {
+			return fmt.Errorf("prepare client repo: %w", err)
+		}
 	}
 	if err := g.argo.UpsertRepo(g.repo.URL(), "meeseeks", g.repo.token); err != nil {
 		return fmt.Errorf("register client repo in ArgoCD: %w", err)
@@ -152,42 +223,87 @@ func (g *GitOps) Bootstrap() error {
 	return nil
 }
 
-func (g *GitOps) Create(req EnvironmentRequest) (string, error) {
+// Create commits one environment, or a whole matrix group, in a single commit.
+func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// An existing app with this name (made outside the client repo, or the root app)
-	// would be adopted by the root app, and a later delete would cascade into it.
-	exists, err := g.argo.Exists(req.Name)
-	if err != nil {
-		return "", fmt.Errorf("check name in ArgoCD: %w", err)
-	}
-	if exists || req.Name == rootApp {
-		return "", fmt.Errorf("name %q is already used by an ArgoCD application", req.Name)
-	}
-
-	content, _ := json.MarshalIndent(buildApplication(req), "", "  ")
-	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s",
-		req.Name, req.Branch, req.EnvType, strings.Join(req.Dependencies, ", "))
-	commit, err := g.repo.CreateFile(envPath(req.Name), append(content, '\n'), msg)
-	if errors.Is(err, errExists) {
-		return "", fmt.Errorf("environment %q already exists in %s", req.Name, g.repo.URL())
-	}
+	s, err := g.repo.snapshot()
 	if err != nil {
 		return "", err
 	}
+	used := usedNames(s.paths)
+	group := reqs[0].Group
+	if group != "" && used[group] {
+		return "", fmt.Errorf("%q is already used in %s", group, g.repo.URL())
+	}
+
+	changes := map[string]*string{}
+	var lines []string
+	for _, r := range reqs {
+		if used[r.Name] || r.Name == rootApp {
+			return "", fmt.Errorf("%q is already used in %s", r.Name, g.repo.URL())
+		}
+		// An existing app with this name (made outside the client repo) would be adopted
+		// by the root app, and a later delete would cascade into it.
+		exists, err := g.argo.Exists(r.Name)
+		if err != nil {
+			return "", fmt.Errorf("check name in ArgoCD: %w", err)
+		}
+		if exists {
+			return "", fmt.Errorf("name %q is already used by an ArgoCD application", r.Name)
+		}
+		content, _ := json.MarshalIndent(buildApplication(r), "", "  ")
+		file := string(content) + "\n"
+		changes[envFile(r)] = &file
+		lines = append(lines, "- "+r.Name+": "+depsSummary(r.Dependencies, r.Versions))
+	}
+
+	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s",
+		reqs[0].Name, reqs[0].Branch, reqs[0].EnvType, depsSummary(reqs[0].Dependencies, reqs[0].Versions))
+	if group != "" {
+		msg = fmt.Sprintf("Create group %s: %d environments\n\nbranch: %s, benchmark: %t\n%s",
+			group, len(reqs), reqs[0].Branch, reqs[0].Benchmark, strings.Join(lines, "\n"))
+	}
+	commit, err := g.repo.commit(s, msg, changes)
+	if err != nil {
+		return "", err
+	}
+	g.benchMu.Lock()
+	for _, r := range reqs {
+		delete(g.bench, r.Name) // a reused name must not show an old result
+	}
+	g.benchMu.Unlock()
 	g.refresh()
 	return commit, nil
 }
 
+// Delete removes an environment, or every environment of a group, in one commit.
 func (g *GitOps) Delete(name string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	commit, err := g.repo.DeleteFile(envPath(name), "Delete environment "+name)
-	if errors.Is(err, errNotFound) {
+	s, err := g.repo.snapshot()
+	if err != nil {
+		return "", err
+	}
+	changes := map[string]*string{}
+	for _, p := range s.paths {
+		rel, ok := strings.CutPrefix(p, "environments/")
+		if ok && strings.HasSuffix(rel, ".json") &&
+			(rel == name+".json" || strings.HasSuffix(rel, "/"+name+".json") || strings.HasPrefix(rel, name+"/")) {
+			changes[p] = nil
+		}
+	}
+	if len(changes) == 0 {
 		return "", fmt.Errorf("environment %q not found in %s", name, g.repo.URL())
 	}
+
+	msg := "Delete environment " + name
+	if len(changes) > 1 || strings.HasPrefix(slices.Collect(maps.Keys(changes))[0], "environments/"+name+"/") {
+		msg = fmt.Sprintf("Delete group %s: %d environments", name, len(changes))
+	}
+	commit, err := g.repo.commit(s, msg, changes)
 	if err != nil {
 		return "", err
 	}
@@ -198,7 +314,12 @@ func (g *GitOps) Delete(name string) (string, error) {
 func (g *GitOps) List() (EnvironmentList, error) {
 	list, err := g.argo.ListApplications()
 	for i := range list.Items {
-		list.Items[i].GitURL = g.repo.FileURL(envPath(list.Items[i].Name))
+		e := &list.Items[i]
+		e.GitURL = g.repo.FileURL(envFile(EnvironmentRequest{Name: e.Name, Group: e.Group}))
+		if e.Benchmark != nil {
+			r := g.benchResult(e.Name)
+			e.Benchmark = &r
+		}
 	}
 	return list, err
 }
@@ -210,4 +331,67 @@ func (g *GitOps) refresh() {
 	if err := g.argo.Refresh(rootApp); err != nil {
 		log.Printf("refresh %s: %v", rootApp, err)
 	}
+}
+
+// BenchResult is what the pgbench Job reported, read from its logs through ArgoCD.
+type BenchResult struct {
+	Done      bool    `json:"done"`
+	TPS       float64 `json:"tps,omitempty"`
+	LatencyMs float64 `json:"latency_ms,omitempty"`
+}
+
+func (g *GitOps) benchResult(name string) BenchResult {
+	g.benchMu.Lock()
+	r, ok := g.bench[name]
+	g.benchMu.Unlock()
+	if ok {
+		return r
+	}
+	logs, err := g.argo.JobLogs(name, "env-"+name, benchJob)
+	if err != nil {
+		return BenchResult{} // the Job may not have started yet
+	}
+	r = parsePgbench(logs)
+	if r.Done {
+		g.benchMu.Lock()
+		if g.bench == nil {
+			g.bench = map[string]BenchResult{}
+		}
+		g.bench[name] = r
+		g.benchMu.Unlock()
+	}
+	return r
+}
+
+var (
+	tpsRe     = regexp.MustCompile(`tps = ([\d.]+) \(without initial connection time\)`)
+	latencyRe = regexp.MustCompile(`latency average = ([\d.]+) ms`)
+)
+
+// parsePgbench reads the summary pgbench prints at the end of a run.
+func parsePgbench(logs string) BenchResult {
+	tps, lat := tpsRe.FindStringSubmatch(logs), latencyRe.FindStringSubmatch(logs)
+	if tps == nil || lat == nil {
+		return BenchResult{}
+	}
+	r := BenchResult{Done: true}
+	r.TPS, _ = strconv.ParseFloat(tps[1], 64)
+	r.LatencyMs, _ = strconv.ParseFloat(lat[1], 64)
+	return r
+}
+
+// depsSummary renders "postgresql 17, redis 8" with the effective versions.
+func depsSummary(deps []string, versions map[string]string) string {
+	if len(deps) == 0 {
+		return "none"
+	}
+	var out []string
+	for _, d := range deps {
+		v := versions[d]
+		if v == "" {
+			v = dependencies[d].defaultVersion()
+		}
+		out = append(out, d+" "+v)
+	}
+	return strings.Join(out, ", ")
 }

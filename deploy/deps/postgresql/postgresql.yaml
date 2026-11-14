@@ -17,6 +17,10 @@ spec:
           image: postgres:16-alpine
           ports:
             - containerPort: 5432
+          # Same slice for every version, so benchmark numbers are comparable.
+          resources:
+            requests: {cpu: 500m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
           env:
             # Throwaway dev credentials for ephemeral environments.
             - name: POSTGRES_DB

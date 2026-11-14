@@ -7,8 +7,10 @@ import (
 	"html"
 	"html/template"
 	"log"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -25,18 +27,36 @@ type EnvironmentRequest struct {
 	Dependencies []string          `json:"dependencies"`
 	EnvType      string            `json:"env_type"`
 	EnvVars      map[string]string `json:"env_vars"`
+
+	Versions  map[string]string   `json:"versions"`  // dependency version, e.g. {"postgresql": "17"}
+	Matrix    map[string][]string `json:"matrix"`    // one environment per version, e.g. {"postgresql": ["16", "17"]}
+	Benchmark bool                `json:"benchmark"` // run pgbench against postgresql
+	Group     string              `json:"-"`         // set by ExpandRequest on matrix members
 }
 
 type EnvironmentResponse struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	URL    string `json:"url"`
-	Commit string `json:"commit"`
+	Status       string       `json:"status"`
+	Commit       string       `json:"commit"`
+	Group        string       `json:"group,omitempty"`
+	Environments []CreatedEnv `json:"environments"`
+}
+
+type CreatedEnv struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
+}
+
+func createdEnvs(reqs []EnvironmentRequest) []CreatedEnv {
+	var out []CreatedEnv
+	for _, r := range reqs {
+		out = append(out, CreatedEnv{ID: r.Name, URL: envURL(r.Name)})
+	}
+	return out
 }
 
 // Environments is the backend: GitOps (client repo + ArgoCD) for real, MockEnvironments in dev mode.
 type Environments interface {
-	Create(req EnvironmentRequest) (commitURL string, err error)
+	Create(reqs []EnvironmentRequest) (commitURL string, err error)
 	List() (EnvironmentList, error)
 	Delete(name string) (commitURL string, err error)
 	RepoURL() string
@@ -53,12 +73,13 @@ func (api *MeeseeksAPI) createEnvironment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := ValidateEnvironmentRequest(req); err != nil {
+	reqs, err := ExpandRequest(req)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	commit, err := api.envs.Create(req)
+	commit, err := api.envs.Create(reqs)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create environment: %v", err), http.StatusInternalServerError)
 		return
@@ -67,7 +88,7 @@ func (api *MeeseeksAPI) createEnvironment(w http.ResponseWriter, r *http.Request
 	// 202: the change is committed; ArgoCD applies it asynchronously.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(EnvironmentResponse{ID: req.Name, Status: "committed", URL: envURL(req.Name), Commit: commit})
+	json.NewEncoder(w).Encode(EnvironmentResponse{Status: "committed", Commit: commit, Group: reqs[0].Group, Environments: createdEnvs(reqs)})
 }
 
 func (api *MeeseeksAPI) listEnvironments(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +144,16 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
         .env-error { color: #991b1b; font-size: 12px; margin-top: 4px; word-break: break-word; }
         .flow { font-size: 13px; color: #555; }
         .flow code { background: #eef1f4; padding: 1px 6px; border-radius: 4px; }
+        .dep-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }
+        .dep-row > label:first-child { min-width: 110px; }
+        .dep-row select { width: auto; padding: 4px; }
+        .group { border: 1px solid #e3e7ec; border-radius: 6px; padding: 12px; margin-top: 12px; }
+        .group-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+        th, td { text-align: left; padding: 6px 8px; border-top: 1px solid #eee; vertical-align: top; }
+        th { color: #666; font-weight: 600; }
+        td.num { font-variant-numeric: tabular-nums; }
+        .best { color: #166534; font-weight: 700; }
     </style>
 </head>
 <body>
@@ -149,11 +180,22 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
                 <div><label for="memory">Memory</label><input id="memory" name="memory" value="128Mi"></div>
                 <div><label for="replicas">Replicas</label><input id="replicas" name="replicas" type="number" value="1" min="1" max="10"></div>
             </div>
-            <div class="field checks">
-                <label style="display:block;font-weight:600">Dependencies</label>
-                <label><input type="checkbox" name="dependencies" value="postgresql"> PostgreSQL</label>
-                <label><input type="checkbox" name="dependencies" value="redis"> Redis</label>
-                <label><input type="checkbox" name="dependencies" value="mongodb"> MongoDB</label>
+            <div class="field">
+                <label>Dependencies</label>
+                {{- range $d := .Deps}}
+                <div class="dep-row checks">
+                    <label><input type="checkbox" name="dependencies" value="{{$d.Name}}"> {{$d.Label}}</label>
+                    <select name="version_{{$d.Name}}" aria-label="{{$d.Label}} version">
+                        {{- range $d.Versions}}<option{{if eq . $d.Default}} selected{{end}}>{{.}}</option>{{end}}
+                    </select>
+                    <span class="hint">or compare</span>
+                    {{- range $d.Versions}}<label><input type="checkbox" name="matrix_{{$d.Name}}" value="{{.}}"> {{.}}</label>{{end}}
+                </div>
+                {{- end}}
+                <div class="hint">Ticking versions under "compare" creates one environment per version, as a group, in a single commit.</div>
+                <div class="checks" style="margin-top:8px">
+                    <label><input type="checkbox" name="benchmark" value="true"> Run pgbench in each environment (needs PostgreSQL)</label>
+                </div>
             </div>
             <div class="field">
                 <label for="env_vars">Environment variables</label>
@@ -174,7 +216,19 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 
 func (api *MeeseeksAPI) serveHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := homeTmpl.Execute(w, struct{ Repo string }{api.envs.RepoURL()}); err != nil {
+	type depOption struct {
+		Name, Label, Default string
+		Versions             []string
+	}
+	var deps []depOption
+	for _, name := range slices.Sorted(maps.Keys(dependencies)) {
+		d := dependencies[name]
+		deps = append(deps, depOption{Name: name, Label: d.label, Default: d.defaultVersion(), Versions: d.versions})
+	}
+	if err := homeTmpl.Execute(w, struct {
+		Repo string
+		Deps []depOption
+	}{api.envs.RepoURL(), deps}); err != nil {
 		log.Printf("render home: %v", err)
 	}
 }
@@ -212,6 +266,17 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 		Dependencies: r.Form["dependencies"],
 		EnvType:      r.FormValue("env_type"),
 		EnvVars:      envVars,
+		Versions:     map[string]string{},
+		Matrix:       map[string][]string{},
+		Benchmark:    r.FormValue("benchmark") == "true",
+	}
+	for dep := range dependencies {
+		if v := r.FormValue("version_" + dep); v != "" && slices.Contains(req.Dependencies, dep) {
+			req.Versions[dep] = v
+		}
+		if vs := r.Form["matrix_"+dep]; len(vs) > 0 {
+			req.Matrix[dep] = vs
+		}
 	}
 	if replicas := r.FormValue("replicas"); replicas != "" {
 		n, err := strconv.Atoi(replicas)
@@ -222,12 +287,13 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 		req.Replicas = n
 	}
 
-	if err := ValidateEnvironmentRequest(req); err != nil {
+	reqs, err := ExpandRequest(req)
+	if err != nil {
 		htmxError(w, "Validation error", err)
 		return
 	}
 
-	commit, err := api.envs.Create(req)
+	commit, err := api.envs.Create(reqs)
 	if err != nil {
 		htmxError(w, "Failed to create environment", err)
 		return
@@ -235,32 +301,96 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("HX-Trigger", "env-changed") // refresh the list
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	successTmpl.Execute(w, struct{ Name, Commit, URL string }{req.Name, commit, envURL(req.Name)})
+	successTmpl.Execute(w, EnvironmentResponse{Commit: commit, Group: reqs[0].Group, Environments: createdEnvs(reqs)})
 }
 
 var successTmpl = template.Must(template.New("success").Parse(`<div class="response success">
-Committed <a href="{{.Commit}}" target="_blank">environment <strong>{{.Name}}</strong></a> to the GitOps repo.
-ArgoCD is syncing it; it will be at <a href="{{.URL}}" target="_blank">{{.URL}}</a></div>`))
+{{- if .Group}}
+Committed <a href="{{.Commit}}" target="_blank">group <strong>{{.Group}}</strong> ({{len .Environments}} environments)</a>
+to the GitOps repo in one commit. ArgoCD is syncing them.
+{{- else}}{{with index .Environments 0}}
+Committed <a href="{{$.Commit}}" target="_blank">environment <strong>{{.ID}}</strong></a> to the GitOps repo.
+ArgoCD is syncing it; it will be at <a href="{{.URL}}" target="_blank">{{.URL}}</a>
+{{- end}}{{end}}</div>`))
 
-var listTmpl = template.Must(template.New("list").Funcs(template.FuncMap{"join": strings.Join}).Parse(`
-{{- range .}}
+var listTmpl = template.Must(template.New("list").Parse(`
+{{- range .Single}}
 <div class="env-item">
   <div>
     <div class="env-name"><a href="{{.URL}}" target="_blank">{{.Name}}</a></div>
     <div class="env-details">
       <span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span>
       <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span>
-      branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .Dependencies}} · {{join . ", "}}{{end}}
+      branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .DepsLabel}} · {{.}}{{end}}
       {{with .GitURL}} · <a href="{{.}}" target="_blank">view in Git</a>{{end}}
+      {{with .Benchmark}} · pgbench {{if .Done}}{{printf "%.0f" .TPS}} TPS, {{printf "%.1f" .LatencyMs}} ms{{else}}running…{{end}}{{end}}
     </div>
     {{with .Message}}<div class="env-error">{{.}}</div>{{end}}
   </div>
   <button class="delete-btn" hx-delete="/environments/{{.Name}}" hx-target="closest .env-item" hx-swap="outerHTML"
     hx-confirm="Delete environment {{.Name}}?">Delete</button>
 </div>
-{{- else}}
+{{- end}}
+{{- range $g := .Groups}}
+<div class="group">
+  <div class="group-header">
+    <div><strong>{{$g.Name}}</strong>
+      <span class="hint">{{len $g.Items}} environments · branch <code>{{(index $g.Items 0).Branch}}</code></span></div>
+    <button class="delete-btn" hx-delete="/environments/{{$g.Name}}" hx-target="closest .group" hx-swap="outerHTML"
+      hx-confirm="Delete group {{$g.Name}} and its {{len $g.Items}} environments?">Delete group</button>
+  </div>
+  <table>
+    <tr><th>Environment</th><th>Dependencies</th><th>Status</th>{{if $g.Bench}}<th>pgbench TPS</th><th>Avg latency</th>{{end}}</tr>
+    {{- range $g.Items}}
+    <tr>
+      <td><a href="{{.URL}}" target="_blank">{{.Name}}</a> · <a href="{{.GitURL}}" target="_blank">git</a>
+        {{with .Message}}<div class="env-error">{{.}}</div>{{end}}</td>
+      <td>{{.DepsLabel}}</td>
+      <td><span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span> <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span></td>
+      {{- if $g.Bench}}{{with .Benchmark}}{{if .Done}}
+      <td class="num{{if eq .TPS $g.BestTPS}} best{{end}}">{{printf "%.0f" .TPS}}</td><td class="num">{{printf "%.1f" .LatencyMs}} ms</td>
+      {{- else}}<td colspan="2" class="hint">running…</td>{{end}}{{else}}<td colspan="2"></td>{{end}}{{end}}
+    </tr>
+    {{- end}}
+  </table>
+  {{- if $g.Bench}}<div class="hint">Same pgbench client and settings everywhere; all environments share one node, so compare relative numbers.</div>{{end}}
+</div>
+{{- end}}
+{{- if and (not .Single) (not .Groups)}}
 <div class="hint">No environments yet.</div>
 {{- end}}`))
+
+type envGroup struct {
+	Name    string
+	Items   []EnvironmentItem
+	Bench   bool
+	BestTPS float64
+}
+
+// groupEnvironments splits the list into standalone environments and matrix groups.
+func groupEnvironments(items []EnvironmentItem) (single []EnvironmentItem, groups []envGroup) {
+	byName := map[string]*envGroup{}
+	for _, e := range items {
+		if e.Group == "" {
+			single = append(single, e)
+			continue
+		}
+		g := byName[e.Group]
+		if g == nil {
+			g = &envGroup{Name: e.Group}
+			byName[e.Group] = g
+		}
+		g.Items = append(g.Items, e)
+		if e.Benchmark != nil {
+			g.Bench = true
+			g.BestTPS = max(g.BestTPS, e.Benchmark.TPS)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(byName)) {
+		groups = append(groups, *byName[name])
+	}
+	return single, groups
+}
 
 func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Request) {
 	environments, err := api.envs.List()
@@ -269,8 +399,12 @@ func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	single, groups := groupEnvironments(environments.Items)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := listTmpl.Execute(w, environments.Items); err != nil {
+	if err := listTmpl.Execute(w, struct {
+		Single []EnvironmentItem
+		Groups []envGroup
+	}{single, groups}); err != nil {
 		log.Printf("render list: %v", err)
 	}
 }
@@ -278,8 +412,8 @@ func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Requ
 // MockEnvironments is a fake backend for UI work without a cluster (make dev-mock).
 type MockEnvironments struct{}
 
-func (m *MockEnvironments) Create(req EnvironmentRequest) (string, error) {
-	log.Printf("Mock: Creating environment %s", req.Name)
+func (m *MockEnvironments) Create(reqs []EnvironmentRequest) (string, error) {
+	log.Printf("Mock: Creating %d environment(s), first %s", len(reqs), reqs[0].Name)
 	return "https://github.com/example/environments/commit/0000000", nil
 }
 
@@ -289,8 +423,16 @@ func (m *MockEnvironments) List() (EnvironmentList, error) {
 			{ID: "test-env-1", Name: "test-env-1", Status: "Healthy", Sync: "Synced", Branch: "main", EnvType: "dev", URL: envURL("test-env-1")},
 			{ID: "staging-app", Name: "staging-app", Status: "Progressing", Sync: "Synced", Branch: "main", EnvType: "staging", Dependencies: []string{"postgresql"}, URL: envURL("staging-app")},
 			{ID: "demo-service", Name: "demo-service", Status: "Healthy", Sync: "Synced", Branch: "demo", EnvType: "dev", Dependencies: []string{"redis", "mongodb"}, URL: envURL("demo-service")},
+			mockBench("pg-compare", "16", 1180, 6.8), mockBench("pg-compare", "17", 1265, 6.3), mockBench("pg-compare", "18", 0, 0),
 		},
 	}, nil
+}
+
+func mockBench(group, version string, tps, latency float64) EnvironmentItem {
+	name := group + "-postgresql-" + version
+	return EnvironmentItem{ID: name, Name: name, Group: group, Status: "Healthy", Sync: "Synced", Branch: "main",
+		Dependencies: []string{"postgresql"}, Versions: map[string]string{"postgresql": version}, URL: envURL(name),
+		Benchmark: &BenchResult{Done: tps > 0, TPS: tps, LatencyMs: latency}}
 }
 
 func (m *MockEnvironments) Delete(name string) (string, error) {

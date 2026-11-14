@@ -21,6 +21,9 @@ func TestBuildApplication(t *testing.T) {
 	if len(app.Metadata.Finalizers) != 1 || app.Metadata.Labels["meeseeks/gitops"] != "true" {
 		t.Fatal("committed apps need the resources finalizer and the gitops label")
 	}
+	if k := src[1].Kustomize; k == nil || len(k.Images) != 1 || k.Images[0] != "postgres=postgres:18-alpine" {
+		t.Fatalf("dependency must pin its image to the default version: %+v", src[1].Kustomize)
+	}
 	k := src[0].Kustomize
 	if k == nil || len(k.Replicas) != 1 || k.Replicas[0].Count != 2 || len(k.Patches) != 1 {
 		t.Fatalf("unexpected kustomize: %+v", k)
@@ -52,5 +55,29 @@ func TestValidateRejects(t *testing.T) {
 	}
 	if err := ValidateEnvironmentRequest(base); err != nil {
 		t.Fatalf("valid request rejected: %v", err)
+	}
+}
+
+func TestExpandRequest(t *testing.T) {
+	reqs, err := ExpandRequest(EnvironmentRequest{Name: "cmp", Branch: "main", Dependencies: []string{"redis"},
+		Matrix: map[string][]string{"postgresql": {"16", "17"}, "redis": {"7", "8"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 4 || reqs[0].Name != "cmp-postgresql-16-redis-7" || reqs[0].Group != "cmp" ||
+		reqs[3].Versions["postgresql"] != "17" || reqs[3].Versions["redis"] != "8" || len(reqs[3].Dependencies) != 2 {
+		t.Fatalf("unexpected expansion: %+v", reqs)
+	}
+
+	for name, req := range map[string]EnvironmentRequest{
+		"too many":           {Name: "x", Branch: "main", Matrix: map[string][]string{"postgresql": {"15", "16", "17", "18"}, "redis": {"7", "8"}, "mongodb": {"7", "8"}}},
+		"unknown version":    {Name: "x", Branch: "main", Matrix: map[string][]string{"postgresql": {"9"}}},
+		"bench without pg":   {Name: "x", Branch: "main", Benchmark: true},
+		"version of non-dep": {Name: "x", Branch: "main", Versions: map[string]string{"redis": "7"}},
+		"member name length": {Name: strings.Repeat("a", 50), Branch: "main", Matrix: map[string][]string{"postgresql": {"16"}}},
+	} {
+		if _, err := ExpandRequest(req); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
 	}
 }
