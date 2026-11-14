@@ -1,44 +1,75 @@
 # Meeseeks
 
-Ephemeral, customizable environments on Kubernetes through a small Go API and web UI.
-Each environment is an ArgoCD `Application`, so every environment is GitOps-managed:
-ArgoCD renders the manifests from Git, applies them, and keeps them in sync.
+Self-service, ephemeral environments on Kubernetes, done the GitOps way.
+A developer asks for an environment (branch, sizing, dependencies, env vars) through a small
+Go API or web UI. Meeseeks doesn't touch the cluster: it **commits the desired state to a Git
+repo**, and ArgoCD reconciles it. Every create and delete is a commit you can review, audit or revert.
 
 ```
-UI / curl ──► Meeseeks (Go) ──► ArgoCD API ──► Application ──► Git (deploy/) ──► Kubernetes
+UI / API ──commit──► client repo (environments/<name>.json) ◄──watch── ArgoCD root app ──► Application per env ──► Kubernetes
+    ▲                                                                                                   │
+    └──────────────────────────────── sync / health status (ArgoCD API) ──────────────────────────────┘
 ```
 
 ![UI](docs/ui.png)
 
-## How a request becomes an environment
+## How it works
 
-`POST /environments` creates one multi-source ArgoCD Application in namespace `env-<name>`:
+- **Client repo** (configurable, e.g. a private `meeseeks-environments`): one ArgoCD `Application`
+  per file under `environments/`. Meeseeks writes these files through the GitHub API.
+- **Root app** (`meeseeks-environments`, app-of-apps): syncs `environments/*.json` into ArgoCD.
+  Meeseeks creates it and registers the repo's credentials on startup (idempotent).
+- **Base manifests** live in this repo under [`deploy/`](deploy): `base/` is the app (an echo server
+  that prints its pod name), `deps/` has PostgreSQL, Redis and MongoDB.
+- **Delete** = a commit that removes the file. The root app prunes the `Application`, and its
+  `resources-finalizer` makes ArgoCD delete the workloads too.
 
-| Request field | What Meeseeks generates |
+What a request turns into, inside each committed `Application`:
+
+| Request field | Generated |
 |---|---|
-| `branch` | `targetRevision` of every source (deploy any branch of this repo's manifests) |
+| `branch` | `targetRevision` of every source (any branch of the base manifests) |
 | `cpu`, `memory` | Strategic-merge patch on Deployment `app` (requests = limits) |
-| `replicas` | ArgoCD `kustomize.replicas` |
+| `replicas` | `kustomize.replicas` |
 | `env_vars` | Env vars in the same patch |
-| `dependencies` | One extra source per dependency (`deploy/deps/<name>`), plus `DATABASE_URL` / `REDIS_URL` / `MONGODB_URL` injected into the app |
+| `dependencies` | One extra source per dependency, plus `DATABASE_URL` / `REDIS_URL` / `MONGODB_URL` injected into the app |
 | `env_type` | `env-type` label (`dev`, `staging`, `prod`) |
 
-Manifests live in [`deploy/`](deploy): `base/` is the app (a tiny echo server that prints its pod name, so
-you can see replicas load-balance), `deps/` has PostgreSQL, Redis and MongoDB.
+### Design notes
+
+- **Status is asynchronous.** A bad branch still commits fine. ArgoCD then reports the error
+  on the `Application`, and the UI shows it on that environment's row.
+- **Git drops empty directories.** `environments/README.md` keeps the directory alive. Without it,
+  deleting the last environment breaks the root app.
+- **The root app sets `allowEmpty: true`.** Otherwise ArgoCD refuses an auto-sync that would
+  leave zero resources ("auto-sync will wipe out all resources"), and the last environment is never pruned.
+- **Names are checked against existing ArgoCD apps** before committing. Otherwise the root app
+  would adopt an unrelated app, and a later delete would cascade into it.
+- After each commit Meeseeks asks ArgoCD to refresh the root app, so changes land in seconds
+  instead of on the ~3 min poll. In production a GitHub webhook to ArgoCD does this.
 
 ## Run it locally (OrbStack)
 
-Requirements: [OrbStack](https://orbstack.dev) with Kubernetes enabled, Terraform, the `argocd` CLI, Go 1.24+.
+Requirements: [OrbStack](https://orbstack.dev) with Kubernetes, Terraform, the `argocd` and `gh` CLIs, Go 1.24+.
 
 ```bash
-cd terraform && terraform init && terraform apply   # installs ArgoCD on :30080, writes argocd-token.txt
+cd terraform && terraform init && terraform apply   # ArgoCD on :30080, writes argocd-token.txt
 cd .. && make run                                   # http://localhost:22282
 ```
 
+Configuration (environment variables; the Makefile has local defaults):
+
+| Variable | Default in `make run` | Purpose |
+|---|---|---|
+| `GITOPS_REPO` | `https://github.com/ezeql/meeseeks-environments` | Client repo Meeseeks commits to |
+| `GITOPS_BRANCH` | `main` | Branch of the client repo |
+| `GITHUB_TOKEN` | `gh auth token` | Write access to the client repo; also registered in ArgoCD to read it |
+| `ARGOCD_URL` / `ARGOCD_TOKEN` | `http://localhost:30080` / `terraform/argocd-token.txt` | ArgoCD API |
+
 Without a cluster, `make dev-mock` serves the UI with fake data.
 
-With OrbStack, each environment is reachable from the Mac at `http://app.env-<name>.svc.cluster.local`
-(the UI links to it). On other clusters use `kubectl port-forward -n env-<name> svc/app 8080:80`.
+With OrbStack, each environment is reachable from the Mac at `http://app.env-<name>.svc.cluster.local`.
+On other clusters use `kubectl port-forward -n env-<name> svc/app 8080:80`.
 
 ## API
 
@@ -48,23 +79,23 @@ curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d
   "cpu": "100m", "memory": "128Mi", "replicas": 2,
   "dependencies": ["postgresql", "redis"],
   "env_vars": {"LOG_LEVEL": "debug"}
-}'
-curl localhost:22282/environments               # list, with sync/health status
-curl -X DELETE localhost:22282/environments/my-feature
+}'                                              # 202 + commit URL
+curl localhost:22282/environments               # list with sync/health status
+curl -X DELETE localhost:22282/environments/my-feature   # 202 + commit URL
 ```
-
-The same endpoints return HTML fragments when called by the UI (HTMX, `HX-Request: true`).
 
 ## Development
 
 ```bash
-make test        # unit tests
+make test        # unit tests (GitHub and ArgoCD faked with httptest)
 make docker      # build the image
 make docker-run  # run it against the local ArgoCD
 ```
 
 ## Known limits
 
-- Deleting an environment removes its resources, but ArgoCD leaves the `env-<name>` namespace behind.
+- The Git writer only supports GitHub (Contents API, one file per commit).
+- Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
+- ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.
 - Dependencies use throwaway credentials and no persistent volumes. These environments are ephemeral.

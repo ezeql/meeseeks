@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-//go:embed static
+//go:embed static/logo.jpg
 var staticFS embed.FS
 
 type EnvironmentRequest struct {
@@ -31,16 +31,19 @@ type EnvironmentResponse struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 	URL    string `json:"url"`
+	Commit string `json:"commit"`
 }
 
-type ArgoCDClientInterface interface {
-	CreateApplication(req EnvironmentRequest) (string, error)
-	ListApplications() (EnvironmentList, error)
-	DeleteApplication(name string) error
+// Environments is the backend: GitOps (client repo + ArgoCD) for real, MockEnvironments in dev mode.
+type Environments interface {
+	Create(req EnvironmentRequest) (commitURL string, err error)
+	List() (EnvironmentList, error)
+	Delete(name string) (commitURL string, err error)
+	RepoURL() string
 }
 
 type MeeseeksAPI struct {
-	argoCDClient ArgoCDClientInterface
+	envs Environments
 }
 
 func (api *MeeseeksAPI) createEnvironment(w http.ResponseWriter, r *http.Request) {
@@ -55,18 +58,20 @@ func (api *MeeseeksAPI) createEnvironment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	envID, err := api.argoCDClient.CreateApplication(req)
+	commit, err := api.envs.Create(req)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create environment: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	// 202: the change is committed; ArgoCD applies it asynchronously.
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(EnvironmentResponse{ID: envID, Status: "creating", URL: envURL(req.Name)})
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(EnvironmentResponse{ID: req.Name, Status: "committed", URL: envURL(req.Name), Commit: commit})
 }
 
 func (api *MeeseeksAPI) listEnvironments(w http.ResponseWriter, r *http.Request) {
-	environments, err := api.argoCDClient.ListApplications()
+	environments, err := api.envs.List()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to list environments: %v", err), http.StatusInternalServerError)
 		return
@@ -76,7 +81,7 @@ func (api *MeeseeksAPI) listEnvironments(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(environments)
 }
 
-const homeHTML = `<!DOCTYPE html>
+var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <title>Meeseeks</title>
@@ -115,14 +120,18 @@ const homeHTML = `<!DOCTYPE html>
         .success { background: #dcfce7; color: #166534; }
         .error { background: #fee2e2; color: #991b1b; word-break: break-word; }
         .hint { color: #888; font-size: 12px; }
+        .env-error { color: #991b1b; font-size: 12px; margin-top: 4px; word-break: break-word; }
+        .flow { font-size: 13px; color: #555; }
+        .flow code { background: #eef1f4; padding: 1px 6px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <header>
-        <img src="/static/meeseeks.jpeg" alt="">
+        <img src="/static/logo.jpg" alt="">
         <div>
             <h1>Meeseeks</h1>
-            <p>Ephemeral environments on Kubernetes, deployed through ArgoCD.</p>
+            <p>Ephemeral environments on Kubernetes, the GitOps way.</p>
+            <p class="flow">Meeseeks commits to <a href="{{.Repo}}" target="_blank"><code>{{.Repo}}</code></a> → ArgoCD syncs it → Kubernetes</p>
         </div>
     </header>
 
@@ -161,11 +170,13 @@ const homeHTML = `<!DOCTYPE html>
         <div id="environments" hx-get="/environments" hx-trigger="load, every 5s, env-changed from:body">Loading…</div>
     </div>
 </body>
-</html>`
+</html>`))
 
 func (api *MeeseeksAPI) serveHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, homeHTML)
+	if err := homeTmpl.Execute(w, struct{ Repo string }{api.envs.RepoURL()}); err != nil {
+		log.Printf("render home: %v", err)
+	}
 }
 
 func htmxError(w http.ResponseWriter, msg string, err error) {
@@ -216,17 +227,20 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if _, err := api.argoCDClient.CreateApplication(req); err != nil {
+	commit, err := api.envs.Create(req)
+	if err != nil {
 		htmxError(w, "Failed to create environment", err)
 		return
 	}
 
 	w.Header().Set("HX-Trigger", "env-changed") // refresh the list
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	url := html.EscapeString(envURL(req.Name))
-	fmt.Fprintf(w, `<div class="response success">Environment <strong>%s</strong> created. ArgoCD is syncing it; it will be at <a href="%s" target="_blank">%s</a></div>`,
-		html.EscapeString(req.Name), url, url)
+	successTmpl.Execute(w, struct{ Name, Commit, URL string }{req.Name, commit, envURL(req.Name)})
 }
+
+var successTmpl = template.Must(template.New("success").Parse(`<div class="response success">
+Committed <a href="{{.Commit}}" target="_blank">environment <strong>{{.Name}}</strong></a> to the GitOps repo.
+ArgoCD is syncing it; it will be at <a href="{{.URL}}" target="_blank">{{.URL}}</a></div>`))
 
 var listTmpl = template.Must(template.New("list").Funcs(template.FuncMap{"join": strings.Join}).Parse(`
 {{- range .}}
@@ -237,7 +251,9 @@ var listTmpl = template.Must(template.New("list").Funcs(template.FuncMap{"join":
       <span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span>
       <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span>
       branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .Dependencies}} · {{join . ", "}}{{end}}
+      {{with .GitURL}} · <a href="{{.}}" target="_blank">view in Git</a>{{end}}
     </div>
+    {{with .Message}}<div class="env-error">{{.}}</div>{{end}}
   </div>
   <button class="delete-btn" hx-delete="/environments/{{.Name}}" hx-target="closest .env-item" hx-swap="outerHTML"
     hx-confirm="Delete environment {{.Name}}?">Delete</button>
@@ -247,7 +263,7 @@ var listTmpl = template.Must(template.New("list").Funcs(template.FuncMap{"join":
 {{- end}}`))
 
 func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Request) {
-	environments, err := api.argoCDClient.ListApplications()
+	environments, err := api.envs.List()
 	if err != nil {
 		htmxError(w, "Failed to list environments", err)
 		return
@@ -259,16 +275,15 @@ func (api *MeeseeksAPI) listEnvironmentsHTMX(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// Mock ArgoCD client for development
-type MockArgoCDClient struct{}
+// MockEnvironments is a fake backend for UI work without a cluster (make dev-mock).
+type MockEnvironments struct{}
 
-func (m *MockArgoCDClient) CreateApplication(req EnvironmentRequest) (string, error) {
+func (m *MockEnvironments) Create(req EnvironmentRequest) (string, error) {
 	log.Printf("Mock: Creating environment %s", req.Name)
-	return req.Name, nil
+	return "https://github.com/example/environments/commit/0000000", nil
 }
 
-func (m *MockArgoCDClient) ListApplications() (EnvironmentList, error) {
-	log.Printf("Mock: Listing applications")
+func (m *MockEnvironments) List() (EnvironmentList, error) {
 	return EnvironmentList{
 		Items: []EnvironmentItem{
 			{ID: "test-env-1", Name: "test-env-1", Status: "Healthy", Sync: "Synced", Branch: "main", EnvType: "dev", URL: envURL("test-env-1")},
@@ -278,31 +293,44 @@ func (m *MockArgoCDClient) ListApplications() (EnvironmentList, error) {
 	}, nil
 }
 
-func (m *MockArgoCDClient) DeleteApplication(name string) error {
-	log.Printf("Mock: Deleting application %s", name)
-	return nil
+func (m *MockEnvironments) Delete(name string) (string, error) {
+	log.Printf("Mock: Deleting environment %s", name)
+	return "https://github.com/example/environments/commit/0000000", nil
+}
+
+func (m *MockEnvironments) RepoURL() string { return "https://github.com/example/environments" }
+
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func main() {
-	argoCDURL := os.Getenv("ARGOCD_URL")
-	if argoCDURL == "" {
-		argoCDURL = "http://localhost:30080"
-	}
-
 	argoCDToken := os.Getenv("ARGOCD_TOKEN")
 
-	var client ArgoCDClientInterface
-
-	// Check if running in development mode
+	var envs Environments
 	if argoCDToken == "" || argoCDToken == "mock-token" || os.Getenv("DEV_MODE") == "true" {
-		log.Println("🚀 Starting Meeseeks in Development Mode (Mock ArgoCD)")
-		log.Println("💡 Running in mock mode - no real ArgoCD calls will be made")
-		client = &MockArgoCDClient{}
+		log.Println("🚀 Starting Meeseeks in Development Mode (mock backend, no Git or ArgoCD calls)")
+		envs = &MockEnvironments{}
 	} else {
-		client = NewArgoCDClient(argoCDURL, argoCDToken)
+		repo, err := NewGitHubRepo(os.Getenv("GITOPS_REPO"), getenv("GITOPS_BRANCH", "main"), os.Getenv("GITHUB_TOKEN"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		if repo.token == "" {
+			log.Fatal("GITHUB_TOKEN is required (write access to GITOPS_REPO)")
+		}
+		gitops := &GitOps{repo: repo, argo: NewArgoCDClient(getenv("ARGOCD_URL", "http://localhost:30080"), argoCDToken)}
+		if err := gitops.Bootstrap(); err != nil {
+			log.Fatalf("bootstrap: %v", err)
+		}
+		log.Printf("GitOps repo: %s (branch %s), root app: %s", repo.URL(), repo.Branch, rootApp)
+		envs = gitops
 	}
 
-	api := &MeeseeksAPI{argoCDClient: client}
+	api := &MeeseeksAPI{envs: envs}
 
 	mux := http.NewServeMux()
 
@@ -327,41 +355,44 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("/environments/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/environments/", api.deleteEnvironment)
 
-		envID := r.URL.Path[len("/environments/"):]
-		if envID == "" {
-			http.Error(w, "Environment ID is required", http.StatusBadRequest)
-			return
-		}
-
-		htmx := r.Header.Get("HX-Request") == "true"
-		if err := api.argoCDClient.DeleteApplication(envID); err != nil {
-			if htmx {
-				htmxError(w, "Failed to delete environment", err)
-			} else {
-				http.Error(w, fmt.Sprintf("Failed to delete environment: %v", err), http.StatusInternalServerError)
-			}
-			return
-		}
-
-		if htmx {
-			w.WriteHeader(http.StatusOK) // empty body: HTMX removes the row
-		} else {
-			w.WriteHeader(http.StatusNoContent)
-		}
-	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "22282"
-	}
-
+	port := getenv("PORT", "22282")
 	log.Printf("Meeseeks API server starting on port %s", port)
 	log.Printf("Frontend available at: http://localhost:%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
+
+func (api *MeeseeksAPI) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	htmx := r.Header.Get("HX-Request") == "true"
+	name := r.URL.Path[len("/environments/"):]
+	commit, err := "", validateName(name) // the name becomes a path in the GitOps repo
+	if err == nil {
+		commit, err = api.envs.Delete(name)
+	}
+	if err != nil {
+		if htmx {
+			htmxError(w, "Failed to delete environment", err)
+		} else {
+			http.Error(w, fmt.Sprintf("Failed to delete environment: %v", err), http.StatusBadRequest)
+		}
+		return
+	}
+
+	if htmx {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		deletedTmpl.Execute(w, struct{ Name, Commit string }{name, commit})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"id": name, "status": "deletion committed", "commit": commit})
+}
+
+var deletedTmpl = template.Must(template.New("deleted").Parse(`<div class="env-item hint">
+Removed <strong>{{.Name}}</strong> in <a href="{{.Commit}}" target="_blank">this commit</a>; ArgoCD is pruning it.</div>`))

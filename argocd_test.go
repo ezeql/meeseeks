@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildApplication(t *testing.T) {
-	app := (&ArgoCDClient{}).buildApplication(EnvironmentRequest{
+	app := buildApplication(EnvironmentRequest{
 		Name: "x", Branch: "feature/a", CPU: "100m", Replicas: 2,
 		Dependencies: []string{"postgresql"}, EnvVars: map[string]string{"LOG_LEVEL": "debug"},
 	})
@@ -17,6 +17,9 @@ func TestBuildApplication(t *testing.T) {
 	}
 	if src[0].TargetRevision != "feature/a" || src[1].TargetRevision != "feature/a" {
 		t.Fatal("all sources must track the requested branch")
+	}
+	if len(app.Metadata.Finalizers) != 1 || app.Metadata.Labels["meeseeks/gitops"] != "true" {
+		t.Fatal("committed apps need the resources finalizer and the gitops label")
 	}
 	k := src[0].Kustomize
 	if k == nil || len(k.Replicas) != 1 || k.Replicas[0].Count != 2 || len(k.Patches) != 1 {

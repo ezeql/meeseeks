@@ -10,6 +10,13 @@ PORT=22282
 ARGOCD_URL=http://localhost:30080
 ARGOCD_TOKEN=$(shell cat terraform/argocd-token.txt)
 
+# GitOps client repo: Meeseeks commits one ArgoCD Application per environment here.
+GITOPS_REPO ?= https://github.com/ezeql/meeseeks-environments
+GITOPS_BRANCH ?= main
+# Needs write access to GITOPS_REPO; defaults to the gh CLI login. Exported, never echoed.
+GITHUB_TOKEN ?= $(shell gh auth token 2>/dev/null)
+export GITOPS_REPO GITOPS_BRANCH GITHUB_TOKEN
+
 # Default target
 all: fmt vet test build
 
@@ -65,6 +72,7 @@ docker-run: docker
 	@docker run -p $(PORT):$(PORT) \
 		-e ARGOCD_URL=http://host.docker.internal:30080 \
 		-e ARGOCD_TOKEN=${ARGOCD_TOKEN} \
+		-e GITOPS_REPO -e GITOPS_BRANCH -e GITHUB_TOKEN \
 		-e PORT=$(PORT) \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 

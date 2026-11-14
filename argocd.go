@@ -12,8 +12,11 @@ import (
 	"time"
 )
 
-// Manifests live in this repo: deploy/base is the app, deploy/deps/<name> each dependency.
+// Base manifests live in this repo: deploy/base is the app, deploy/deps/<name> each dependency.
 const manifestsRepo = "https://github.com/ezeql/meeseeks"
+
+// rootApp is the app-of-apps that syncs the client repo's environments/ directory.
+const rootApp = "meeseeks-environments"
 
 // Supported dependencies and the env var injected into the app so it can reach each one.
 var dependencyEnv = map[string][2]string{
@@ -42,14 +45,16 @@ type ArgoCDApplication struct {
 }
 
 type ArgoCDApplicationMetadata struct {
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace"`
-	Labels    map[string]string `json:"labels"`
+	Name       string            `json:"name"`
+	Namespace  string            `json:"namespace"`
+	Labels     map[string]string `json:"labels"`
+	Finalizers []string          `json:"finalizers,omitempty"`
 }
 
 type ArgoCDApplicationSpec struct {
 	Project     string                    `json:"project"`
-	Sources     []ArgoCDApplicationSource `json:"sources"`
+	Source      *ArgoCDApplicationSource  `json:"source,omitempty"`
+	Sources     []ArgoCDApplicationSource `json:"sources,omitempty"`
 	Destination ArgoCDDestination         `json:"destination"`
 	SyncPolicy  *ArgoCDSyncPolicy         `json:"syncPolicy,omitempty"`
 }
@@ -59,6 +64,11 @@ type ArgoCDApplicationSource struct {
 	TargetRevision string           `json:"targetRevision"`
 	Path           string           `json:"path"`
 	Kustomize      *ArgoCDKustomize `json:"kustomize,omitempty"`
+	Directory      *ArgoCDDirectory `json:"directory,omitempty"`
+}
+
+type ArgoCDDirectory struct {
+	Include string `json:"include,omitempty"`
 }
 
 type ArgoCDKustomize struct {
@@ -92,8 +102,9 @@ type ArgoCDSyncPolicy struct {
 }
 
 type ArgoCDAutomatedSync struct {
-	SelfHeal bool `json:"selfHeal"`
-	Prune    bool `json:"prune"`
+	SelfHeal   bool `json:"selfHeal"`
+	Prune      bool `json:"prune"`
+	AllowEmpty bool `json:"allowEmpty,omitempty"`
 }
 
 type EnvironmentList struct {
@@ -105,10 +116,12 @@ type EnvironmentItem struct {
 	Name         string   `json:"name"`
 	Status       string   `json:"status"` // ArgoCD health, or "Deleting"
 	Sync         string   `json:"sync"`
+	Message      string   `json:"message,omitempty"` // ArgoCD error, e.g. a branch that doesn't exist
 	Branch       string   `json:"branch"`
 	EnvType      string   `json:"env_type"`
 	Dependencies []string `json:"dependencies"`
 	URL          string   `json:"url"`
+	GitURL       string   `json:"git_url,omitempty"`
 }
 
 // apiError includes ArgoCD's response body so the real reason isn't lost.
@@ -127,53 +140,64 @@ func NewArgoCDClient(baseURL, token string) *ArgoCDClient {
 	}
 }
 
-func (c *ArgoCDClient) CreateApplication(req EnvironmentRequest) (string, error) {
-	app := c.buildApplication(req)
-
-	appJSON, err := json.Marshal(app)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal application: %w", err)
+// call sends in (if any) as JSON and decodes the response into out (if any).
+func (c *ArgoCDClient) call(method, path string, in, out any) error {
+	var body io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(b)
 	}
-
-	httpReq, err := http.NewRequest("POST", c.baseURL+"/api/v1/applications", bytes.NewBuffer(appJSON))
+	req, err := http.NewRequest(method, c.baseURL+path, body)
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return err
 	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
 
-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(httpReq)
+	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to create application: %w", err)
+		return fmt.Errorf("ArgoCD %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", apiError(resp)
+	if resp.StatusCode >= 300 {
+		return apiError(resp)
 	}
-
-	return req.Name, nil
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
 }
 
+// Exists reports whether ArgoCD has an Application with this name.
+// ArgoCD answers 403 rather than 404 for missing apps, so only 200 counts.
+func (c *ArgoCDClient) Exists(name string) bool {
+	return c.call("GET", "/api/v1/applications/"+name, nil, nil) == nil
+}
+
+// Refresh makes ArgoCD re-read Git now instead of on its next poll (~3 min).
+func (c *ArgoCDClient) Refresh(name string) error {
+	return c.call("GET", "/api/v1/applications/"+name+"?refresh=normal", nil, nil)
+}
+
+// UpsertRepo registers a private Git repo's credentials in ArgoCD.
+func (c *ArgoCDClient) UpsertRepo(repoURL, username, password string) error {
+	return c.call("POST", "/api/v1/repositories?upsert=true", map[string]string{
+		"type": "git", "repo": repoURL, "username": username, "password": password,
+	}, nil)
+}
+
+// UpsertApplication creates or updates an Application. validate=false because the
+// root app's path may not exist in Git yet.
+func (c *ArgoCDClient) UpsertApplication(app ArgoCDApplication) error {
+	return c.call("POST", "/api/v1/applications?upsert=true&validate=false", app, nil)
+}
+
+// ListApplications returns the environments that came from the client repo.
 func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
-	httpReq, err := http.NewRequest("GET", c.baseURL+"/api/v1/applications", nil)
-	if err != nil {
-		return EnvironmentList{}, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return EnvironmentList{}, fmt.Errorf("failed to list applications: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return EnvironmentList{}, apiError(resp)
-	}
-
 	type rawSource struct {
 		TargetRevision string `json:"targetRevision"`
 		Path           string `json:"path"`
@@ -186,7 +210,6 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 				DeletionTimestamp string            `json:"deletionTimestamp"`
 			} `json:"metadata"`
 			Spec struct {
-				Source  *rawSource  `json:"source"`
 				Sources []rawSource `json:"sources"`
 			} `json:"spec"`
 			Status struct {
@@ -196,22 +219,25 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 				Health struct {
 					Status string `json:"status"`
 				} `json:"health"`
+				Conditions []struct {
+					Message string `json:"message"`
+				} `json:"conditions"`
+				OperationState struct {
+					Phase   string `json:"phase"`
+					Message string `json:"message"`
+				} `json:"operationState"`
 			} `json:"status"`
 		} `json:"items"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&rawApps); err != nil {
-		return EnvironmentList{}, fmt.Errorf("failed to decode response: %w", err)
+	if err := c.call("GET", "/api/v1/applications", nil, &rawApps); err != nil {
+		return EnvironmentList{}, err
 	}
 
 	environments := []EnvironmentItem{}
 	for _, app := range rawApps.Items {
-		if app.Metadata.Labels["managed-by"] != "meeseeks" {
+		if app.Metadata.Labels["meeseeks/gitops"] != "true" {
 			continue
-		}
-		sources := app.Spec.Sources
-		if app.Spec.Source != nil { // apps created before multi-source
-			sources = append([]rawSource{*app.Spec.Source}, sources...)
 		}
 		env := EnvironmentItem{
 			ID:      app.Metadata.Name,
@@ -224,10 +250,15 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 		if app.Metadata.DeletionTimestamp != "" {
 			env.Status = "Deleting"
 		}
-		if len(sources) > 0 {
-			env.Branch = sources[0].TargetRevision
+		if len(app.Status.Conditions) > 0 {
+			env.Message = app.Status.Conditions[0].Message
+		} else if p := app.Status.OperationState.Phase; p == "Failed" || p == "Error" {
+			env.Message = app.Status.OperationState.Message
 		}
-		for _, s := range sources {
+		if len(app.Spec.Sources) > 0 {
+			env.Branch = app.Spec.Sources[0].TargetRevision
+		}
+		for _, s := range app.Spec.Sources {
 			if dep, ok := strings.CutPrefix(s.Path, "deploy/deps/"); ok {
 				env.Dependencies = append(env.Dependencies, dep)
 			}
@@ -238,30 +269,41 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 	return EnvironmentList{Items: environments}, nil
 }
 
-func (c *ArgoCDClient) DeleteApplication(name string) error {
-	httpReq, err := http.NewRequest("DELETE", c.baseURL+"/api/v1/applications/"+name, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+// buildRootApp is the app-of-apps: it syncs every environments/*.json from the client
+// repo into the argocd namespace. allowEmpty lets it prune the last environment;
+// without it ArgoCD refuses an auto-sync that would leave zero resources.
+func buildRootApp(repoURL, branch string) ArgoCDApplication {
+	return ArgoCDApplication{
+		APIVersion: "argoproj.io/v1alpha1",
+		Kind:       "Application",
+		Metadata: ArgoCDApplicationMetadata{
+			Name:      rootApp,
+			Namespace: "argocd",
+			Labels:    map[string]string{"managed-by": "meeseeks"},
+		},
+		Spec: ArgoCDApplicationSpec{
+			Project: "default",
+			Source: &ArgoCDApplicationSource{
+				RepoURL:        repoURL,
+				TargetRevision: branch,
+				Path:           "environments",
+				Directory:      &ArgoCDDirectory{Include: "*.json"},
+			},
+			Destination: ArgoCDDestination{
+				Server:    "https://kubernetes.default.svc",
+				Namespace: "argocd",
+			},
+			SyncPolicy: &ArgoCDSyncPolicy{
+				Automated: &ArgoCDAutomatedSync{SelfHeal: true, Prune: true, AllowEmpty: true},
+			},
+		},
 	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return fmt.Errorf("failed to delete application: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return apiError(resp)
-	}
-
-	return nil
 }
 
-// buildApplication makes one multi-source Application: the app (kustomize, customized
-// per request) plus a plain directory source per dependency, all from the same branch.
-func (c *ArgoCDClient) buildApplication(req EnvironmentRequest) ArgoCDApplication {
+// buildApplication is the environment as it gets committed to the client repo: one
+// multi-source Application with the app (kustomize, customized per request) plus a
+// plain directory source per dependency, all from the same branch.
+func buildApplication(req EnvironmentRequest) ArgoCDApplication {
 	sources := []ArgoCDApplicationSource{{
 		RepoURL:        manifestsRepo,
 		TargetRevision: req.Branch,
@@ -283,9 +325,13 @@ func (c *ArgoCDClient) buildApplication(req EnvironmentRequest) ArgoCDApplicatio
 			Name:      req.Name,
 			Namespace: "argocd",
 			Labels: map[string]string{
-				"managed-by": "meeseeks",
-				"env-type":   req.EnvType,
+				"managed-by":      "meeseeks",
+				"meeseeks/gitops": "true",
+				"env-type":        req.EnvType,
 			},
+			// Removing the file from Git prunes this Application; the finalizer makes
+			// ArgoCD delete its workloads too instead of orphaning them.
+			Finalizers: []string{"resources-finalizer.argocd.argoproj.io"},
 		},
 		Spec: ArgoCDApplicationSpec{
 			Project: "default",
