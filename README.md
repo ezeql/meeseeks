@@ -34,6 +34,18 @@ What a request turns into, inside each committed `Application`:
 | `env_vars` | Env vars in the same patch |
 | `dependencies` | One extra source per dependency, plus `DATABASE_URL` / `REDIS_URL` / `MONGODB_URL` injected into the app |
 | `env_type` | `env-type` label (`dev`, `staging`, `prod`) |
+| `versions` | Kustomize image override per dependency (PostgreSQL 15–18, Redis 7–8, MongoDB 7–8) |
+| `matrix` | One environment per combination, as a group under `environments/<group>/`, in **one commit** |
+| `benchmark` | A pgbench Job per environment; results read from its logs through Argo CD and compared per group |
+
+Example: compare PostgreSQL versions on the same branch (shown in the screenshot):
+
+```bash
+curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d '{
+  "name": "pg-compare", "branch": "main", "benchmark": true,
+  "matrix": {"postgresql": ["15", "16", "17", "18"]}
+}'
+```
 
 ### Design notes
 
@@ -50,10 +62,11 @@ What a request turns into, inside each committed `Application`:
 
 ## Run it locally (OrbStack)
 
-Requirements: [OrbStack](https://orbstack.dev) with Kubernetes, Terraform, the `argocd` and `gh` CLIs, Go 1.24+.
+Requirements: [OrbStack](https://orbstack.dev) with Kubernetes, OpenTofu or Terraform, the `argocd` and `gh` CLIs, Go 1.24+.
+Argo CD v3.6.1 (Helm chart 10.18.0) is installed by `terraform/`.
 
 ```bash
-cd terraform && terraform init && terraform apply   # ArgoCD on :30080, writes argocd-token.txt
+cd terraform && tofu init && tofu apply         # ArgoCD on :30080, writes argocd-token.txt
 cd .. && make run                                   # http://localhost:22282
 ```
 
