@@ -327,7 +327,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
     </div>
     {{with .Message}}<div class="env-error">{{.}}</div>{{end}}
   </div>
-  <button class="delete-btn" hx-delete="/environments/{{.Name}}" hx-target="closest .env-item" hx-swap="outerHTML"
+  <button class="delete-btn" hx-delete="/environments/{{.Name}}" hx-target="#response"
     hx-confirm="Delete environment {{.Name}}?">Delete</button>
 </div>
 {{- end}}
@@ -336,7 +336,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
   <div class="group-header">
     <div><strong>{{$g.Name}}</strong>
       <span class="hint">{{len $g.Items}} environments · branch <code>{{(index $g.Items 0).Branch}}</code></span></div>
-    <button class="delete-btn" hx-delete="/environments/{{$g.Name}}" hx-target="closest .group" hx-swap="outerHTML"
+    <button class="delete-btn" hx-delete="/environments/{{$g.Name}}" hx-target="#response"
       hx-confirm="Delete group {{$g.Name}} and its {{len $g.Items}} environments?">Delete group</button>
   </div>
   <table>
@@ -527,6 +527,9 @@ func (api *MeeseeksAPI) deleteEnvironment(w http.ResponseWriter, r *http.Request
 	}
 
 	if htmx {
+		// Feedback goes to #response (the list re-renders every 5 s and could drop a row-level
+		// swap); the trigger refreshes the list right away.
+		w.Header().Set("HX-Trigger", "env-changed")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		deletedTmpl.Execute(w, struct{ Name, Commit string }{name, commit})
 		return
@@ -536,5 +539,5 @@ func (api *MeeseeksAPI) deleteEnvironment(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]string{"id": name, "status": "deletion committed", "commit": commit})
 }
 
-var deletedTmpl = template.Must(template.New("deleted").Parse(`<div class="env-item hint">
+var deletedTmpl = template.Must(template.New("deleted").Parse(`<div class="response success">
 Removed <strong>{{.Name}}</strong> in <a href="{{.Commit}}" target="_blank">this commit</a>; ArgoCD is pruning it.</div>`))
