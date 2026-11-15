@@ -314,7 +314,7 @@ ArgoCD is syncing it; it will be at <a href="{{.URL}}" target="_blank">{{.URL}}<
 {{- end}}{{end}}</div>`))
 
 var listTmpl = template.Must(template.New("list").Parse(`
-{{- range .Single}}
+{{- range $e := .Single}}
 <div class="env-item">
   <div>
     <div class="env-name"><a href="{{.URL}}" target="_blank">{{.Name}}</a></div>
@@ -323,7 +323,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
       <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span>
       branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .DepsLabel}} · {{.}}{{end}}
       {{with .GitURL}} · <a href="{{.}}" target="_blank">view in Git</a>{{end}}
-      {{with .Benchmark}} · pgbench {{if .Done}}{{printf "%.0f" .TPS}} TPS, {{printf "%.1f" .LatencyMs}} ms{{else}}running…{{end}}{{end}}
+      {{with .Benchmark}} · pgbench {{if .Done}}{{printf "%.0f" .TPS}} TPS, {{printf "%.1f" .LatencyMs}} ms{{else if eq $e.Status "Progressing"}}running…{{else}}no result{{end}}{{end}}
     </div>
     {{with .Message}}<div class="env-error">{{.}}</div>{{end}}
   </div>
@@ -341,7 +341,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
   </div>
   <table>
     <tr><th>Environment</th><th>Dependencies</th><th>Status</th>{{if $g.Bench}}<th>pgbench TPS</th><th>Avg latency</th>{{end}}</tr>
-    {{- range $g.Items}}
+    {{- range $e := $g.Items}}
     <tr>
       <td><a href="{{.URL}}" target="_blank">{{.Name}}</a> · <a href="{{.GitURL}}" target="_blank">git</a>
         {{with .Message}}<div class="env-error">{{.}}</div>{{end}}</td>
@@ -349,11 +349,11 @@ var listTmpl = template.Must(template.New("list").Parse(`
       <td><span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span> <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span></td>
       {{- if $g.Bench}}{{with .Benchmark}}{{if .Done}}
       <td class="num{{if eq .TPS $g.BestTPS}} best{{end}}">{{printf "%.0f" .TPS}}</td><td class="num">{{printf "%.1f" .LatencyMs}} ms</td>
-      {{- else}}<td colspan="2" class="hint">running…</td>{{end}}{{else}}<td colspan="2"></td>{{end}}{{end}}
+      {{- else}}<td colspan="2" class="hint">{{if eq $e.Status "Progressing"}}running…{{else}}no result{{end}}</td>{{end}}{{else}}<td colspan="2"></td>{{end}}{{end}}
     </tr>
     {{- end}}
   </table>
-  {{- if $g.Bench}}<div class="hint">Same pgbench client and settings everywhere; all environments share one node, so compare relative numbers.</div>{{end}}
+  {{- if $g.Bench}}<div class="hint">Same pgbench client and settings everywhere, but the runs are concurrent on one node and may not overlap exactly: treat the numbers as indicative.</div>{{end}}
 </div>
 {{- end}}
 {{- if and (not .Single) (not .Groups)}}

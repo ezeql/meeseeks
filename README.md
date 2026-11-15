@@ -36,7 +36,7 @@ What a request turns into, inside each committed `Application`:
 | `env_type` | `env-type` label (`dev`, `staging`, `prod`) |
 | `versions` | Kustomize image override per dependency (PostgreSQL 15–18, Redis 7–8, MongoDB 7–8) |
 | `matrix` | One environment per combination, as a group under `environments/<group>/`, in **one commit** |
-| `benchmark` | A pgbench Job per environment; results read from its logs through Argo CD and compared per group |
+| `benchmark` | A pgbench Job per environment; results read from its logs through Argo CD and shown side by side per group |
 
 Example: compare PostgreSQL versions on the same branch (shown in the screenshot):
 
@@ -111,4 +111,8 @@ make docker-run  # run it against the local ArgoCD
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
 - ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.
+- Benchmark numbers are indicative. Every run in a group is concurrent on the same node, and the
+  runs start when each Postgres is ready, so they don't overlap exactly. In one run on this setup
+  PG 18 started 8 s after the others and ran alone for its last 8 s. A fair comparison needs
+  dedicated nodes or runs one after another.
 - Dependencies use throwaway credentials and no persistent volumes. These environments are ephemeral.
