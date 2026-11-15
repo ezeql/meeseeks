@@ -107,7 +107,7 @@ make docker-run  # run it against the local ArgoCD
 
 ## Known limits
 
-- The Git writer only supports GitHub (Contents API, one file per commit).
+- The Git writer only supports GitHub (Git Data API).
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
 - ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.

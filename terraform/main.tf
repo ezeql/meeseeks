@@ -250,15 +250,11 @@ resource "null_resource" "argocd_token" {
       
       # Save token to file
       echo "$TOKEN" > argocd-token.txt
-      echo "Token content: $TOKEN"
       echo "Token saved to argocd-token.txt"
-      echo "ARGOCD_TOKEN=$TOKEN"
-      
+
       # Verify file was created
       if [ -f "argocd-token.txt" ]; then
         echo "File created successfully, size: $(wc -c < argocd-token.txt) bytes"
-        echo "File contents:"
-        cat argocd-token.txt
       else
         echo "ERROR: File was not created"
       fi
