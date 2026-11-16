@@ -66,7 +66,7 @@ curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d
 
 ## Run it locally
 
-Requirements: Docker, Go 1.24+, `kubectl`, and a GitHub token that can write to your client repo.
+Requirements: Docker, Go 1.24+, `kubectl`, and the `gh` CLI (or export a `GITHUB_TOKEN` that can write to your client repo).
 
 ```bash
 gh repo create <you>/meeseeks-environments --private --add-readme   # your client repo (needs one commit)
@@ -78,6 +78,7 @@ make down                                                             # delete t
 `make up` runs [kind](https://kind.sigs.k8s.io) through `go run`, so there is nothing else to install. It keeps
 its kubeconfig and the Argo CD API token in `.kind/` and leaves your current `kubectl` context alone
 (`kubectl --kubeconfig .kind/kubeconfig ...` to look inside). While `.kind/` exists, `make run` uses that cluster.
+If port 30080 is taken, use another one: `make up ARGOCD_PORT=30090`.
 
 **Existing cluster instead** (e.g. OrbStack): `terraform/` installs Argo CD v3.6.1 (Helm chart 10.18.0) on the
 current context and writes `terraform/argocd-token.txt`, which `make run` picks up when there is no `.kind/`:
