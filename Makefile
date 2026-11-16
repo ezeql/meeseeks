@@ -99,10 +99,10 @@ up:
 	@url=http://localhost:$(ARGOCD_PORT); session=; \
 	for i in $$(seq 60); do \
 		pass=$$($(KUBECTL) -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d); \
-		session=$$(curl -sf $$url/api/v1/session -d "{\"username\":\"admin\",\"password\":\"$$pass\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+		session=$$(curl -sf -H "Content-Type: application/json" $$url/api/v1/session -d "{\"username\":\"admin\",\"password\":\"$$pass\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 		[ -n "$$session" ] && break; sleep 2; \
 	done; \
-	token=$$(curl -sf -X POST -H "Authorization: Bearer $$session" $$url/api/v1/account/admin/token -d '{}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+	token=$$(curl -sf -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $$session" $$url/api/v1/account/admin/token -d '{}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 	[ -n "$$token" ] || { echo "Could not get an Argo CD API token from $$url"; exit 1; }; \
 	printf 'ARGOCD_URL=%s\nARGOCD_TOKEN=%s\n' "$$url" "$$token" > .kind/env
 	@echo "Argo CD is up at http://localhost:$(ARGOCD_PORT). Next: make run"
