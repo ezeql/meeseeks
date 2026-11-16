@@ -6,8 +6,10 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeGitHub implements the slice of GitHub's Git Data API that GitHubRepo uses,
@@ -112,6 +114,10 @@ func TestGitOpsCreateDelete(t *testing.T) {
 	var app ArgoCDApplication
 	if err := json.Unmarshal([]byte(gh.files["environments/feat.json"]), &app); err != nil || app.Metadata.Name != "feat" {
 		t.Fatalf("committed file is not the Application: %v %+v", err, app.Metadata)
+	}
+	if exp, err := time.Parse(time.RFC3339, app.Metadata.Annotations[expiresAt]); err != nil ||
+		time.Until(exp) < defaultTTL-time.Minute || time.Until(exp) > defaultTTL {
+		t.Fatalf("no ttl should mean the default expiry, got %q", app.Metadata.Annotations[expiresAt])
 	}
 	if refreshes != 1 {
 		t.Fatalf("root app should be refreshed after a commit, got %d", refreshes)
@@ -273,6 +279,58 @@ func TestNewGitHubRepoRejectsNonGitHub(t *testing.T) {
 	for _, u := range []string{"", "https://gitlab.com/o/r", "https://github.com/o", "::"} {
 		if _, err := NewGitHubRepo(u, "main", "t"); err == nil {
 			t.Errorf("%q: expected error", u)
+		}
+	}
+}
+
+func TestReapExpired(t *testing.T) {
+	past, future := "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"
+	item := func(name, group, expires string) string {
+		labels := `"meeseeks/gitops":"true"`
+		if group != "" {
+			labels += `,"meeseeks/group":"` + group + `"`
+		}
+		ann := ""
+		if expires != "" {
+			ann = `,"annotations":{"meeseeks/expires-at":"` + expires + `"}`
+		}
+		return `{"metadata":{"name":"` + name + `","labels":{` + labels + `}` + ann + `}}`
+	}
+	listOK := true
+	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Query().Get("refresh") != "":
+		case r.URL.Path == "/api/v1/applications" && listOK:
+			io.WriteString(w, `{"items":[`+strings.Join([]string{
+				item("old", "", past), item("fresh", "", future),
+				item("grp-a", "grp", past), item("grp-b", "grp", past),
+				item("forever", "", ""), item("garbled", "", "next tuesday"),
+			}, ",")+`]}`)
+		default:
+			http.Error(w, "boom", 500)
+		}
+	}))
+	defer argo.Close()
+
+	g, gh := newTestGitOps(t, argo.URL)
+	for _, f := range []string{"old", "fresh", "grp/grp-a", "grp/grp-b", "forever", "garbled"} {
+		gh.files["environments/"+f+".json"] = "{}"
+	}
+
+	listOK = false
+	g.ReapExpired(time.Now())
+	if len(gh.messages) != 0 {
+		t.Fatalf("a failed list must not delete anything, got %v", gh.messages)
+	}
+
+	listOK = true
+	g.ReapExpired(time.Now())
+	if want := []string{"Expire group grp: 2 environments", "Expire environment old"}; !slices.Equal(gh.messages, want) {
+		t.Fatalf("commits = %q, want %q", gh.messages, want)
+	}
+	for _, f := range []string{"fresh", "forever", "garbled"} {
+		if _, ok := gh.files["environments/"+f+".json"]; !ok {
+			t.Errorf("%s must survive: only a parsed, passed expiry deletes", f)
 		}
 	}
 }

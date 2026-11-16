@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -238,9 +239,17 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 		return "", fmt.Errorf("%q is already used in %s", group, g.repo.URL())
 	}
 
+	ttl, err := parseTTL(reqs[0].TTL)
+	if err != nil {
+		return "", err
+	}
+	expires := time.Now().Add(ttl).UTC().Truncate(time.Second) // one expiry for the whole group
+
 	changes := map[string]*string{}
 	var lines []string
-	for _, r := range reqs {
+	for i := range reqs {
+		reqs[i].ExpiresAt = expires
+		r := reqs[i]
 		if used[r.Name] || r.Name == rootApp {
 			return "", fmt.Errorf("%q is already used in %s", r.Name, g.repo.URL())
 		}
@@ -259,11 +268,11 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 		lines = append(lines, "- "+r.Name+": "+depsSummary(r.Dependencies, r.Versions))
 	}
 
-	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s",
-		reqs[0].Name, reqs[0].Branch, reqs[0].EnvType, depsSummary(reqs[0].Dependencies, reqs[0].Versions))
+	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s, expires: %s",
+		reqs[0].Name, reqs[0].Branch, reqs[0].EnvType, depsSummary(reqs[0].Dependencies, reqs[0].Versions), expires.Format(time.RFC3339))
 	if group != "" {
-		msg = fmt.Sprintf("Create group %s: %d environments\n\nbranch: %s, benchmark: %t\n%s",
-			group, len(reqs), reqs[0].Branch, reqs[0].Benchmark, strings.Join(lines, "\n"))
+		msg = fmt.Sprintf("Create group %s: %d environments\n\nbranch: %s, benchmark: %t, expires: %s\n%s",
+			group, len(reqs), reqs[0].Branch, reqs[0].Benchmark, expires.Format(time.RFC3339), strings.Join(lines, "\n"))
 	}
 	commit, err := g.repo.commit(s, msg, changes)
 	if err != nil {
@@ -279,7 +288,36 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 }
 
 // Delete removes an environment, or every environment of a group, in one commit.
-func (g *GitOps) Delete(name string) (string, error) {
+func (g *GitOps) Delete(name string) (string, error) { return g.remove(name, "Delete") }
+
+// ReapExpired removes every environment whose expiry has passed, a whole group at a time.
+// Environments without the annotation, or with one that doesn't parse, never expire.
+func (g *GitOps) ReapExpired(now time.Time) {
+	list, err := g.argo.ListApplications()
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	expired := map[string]bool{}
+	for _, e := range list.Items {
+		t, err := time.Parse(time.RFC3339, e.ExpiresAt)
+		if err != nil || e.Status == "Deleting" || now.Before(t) {
+			continue
+		}
+		expired[cmp.Or(e.Group, e.Name)] = true
+	}
+	for _, name := range slices.Sorted(maps.Keys(expired)) {
+		commit, err := g.remove(name, "Expire")
+		if err != nil {
+			log.Printf("reaper: %s: %v", name, err)
+			continue
+		}
+		log.Printf("reaper: %s expired, removed in %s", name, commit)
+	}
+}
+
+// remove deletes name (an environment or a group) in one commit; verb starts the commit message.
+func (g *GitOps) remove(name, verb string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -299,9 +337,9 @@ func (g *GitOps) Delete(name string) (string, error) {
 		return "", fmt.Errorf("environment %q not found in %s", name, g.repo.URL())
 	}
 
-	msg := "Delete environment " + name
+	msg := verb + " environment " + name
 	if len(changes) > 1 || strings.HasPrefix(slices.Collect(maps.Keys(changes))[0], "environments/"+name+"/") {
-		msg = fmt.Sprintf("Delete group %s: %d environments", name, len(changes))
+		msg = fmt.Sprintf("%s group %s: %d environments", verb, name, len(changes))
 	}
 	commit, err := g.repo.commit(s, msg, changes)
 	if err != nil {

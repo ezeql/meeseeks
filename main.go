@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 //go:embed static/logo.jpg
@@ -31,7 +32,9 @@ type EnvironmentRequest struct {
 	Versions  map[string]string   `json:"versions"`  // dependency version, e.g. {"postgresql": "17"}
 	Matrix    map[string][]string `json:"matrix"`    // one environment per version, e.g. {"postgresql": ["16", "17"]}
 	Benchmark bool                `json:"benchmark"` // run pgbench against postgresql
+	TTL       string              `json:"ttl"`       // Go duration, e.g. "4h"; default 24h
 	Group     string              `json:"-"`         // set by ExpandRequest on matrix members
+	ExpiresAt time.Time           `json:"-"`         // set by GitOps.Create from TTL
 }
 
 type EnvironmentResponse struct {
@@ -174,6 +177,8 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
                 <div><label for="branch">Branch</label><input id="branch" name="branch" value="main" required></div>
                 <div><label for="env_type">Type</label>
                     <select id="env_type" name="env_type"><option>dev</option><option>staging</option><option>prod</option></select></div>
+                <div><label for="ttl">Expires after</label>
+                    <select id="ttl" name="ttl"><option value="1h">1 hour</option><option value="4h">4 hours</option><option value="24h" selected>1 day</option><option value="72h">3 days</option><option value="168h">7 days</option></select></div>
             </div>
             <div class="grid field">
                 <div><label for="cpu">CPU</label><input id="cpu" name="cpu" value="100m"></div>
@@ -269,6 +274,7 @@ func (api *MeeseeksAPI) createEnvironmentHTMX(w http.ResponseWriter, r *http.Req
 		Versions:     map[string]string{},
 		Matrix:       map[string][]string{},
 		Benchmark:    r.FormValue("benchmark") == "true",
+		TTL:          r.FormValue("ttl"),
 	}
 	for dep := range dependencies {
 		if v := r.FormValue("version_" + dep); v != "" && slices.Contains(req.Dependencies, dep) {
@@ -322,7 +328,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
       <span class="badge {{.Sync}}">{{or .Sync "Unknown"}}</span>
       <span class="badge {{.Status}}">{{or .Status "Unknown"}}</span>
       branch <code>{{.Branch}}</code>{{with .EnvType}} · {{.}}{{end}}{{with .DepsLabel}} · {{.}}{{end}}
-      {{with .GitURL}} · <a href="{{.}}" target="_blank">view in Git</a>{{end}}
+      {{with .GitURL}} · <a href="{{.}}" target="_blank">view in Git</a>{{end}}{{with .Expiry}} · {{.}}{{end}}
       {{with .Benchmark}} · pgbench {{if .Done}}{{printf "%.0f" .TPS}} TPS, {{printf "%.1f" .LatencyMs}} ms{{else if eq $e.Status "Progressing"}}running…{{else}}no result{{end}}{{end}}
     </div>
     {{with .Message}}<div class="env-error">{{.}}</div>{{end}}
@@ -335,7 +341,7 @@ var listTmpl = template.Must(template.New("list").Parse(`
 <div class="group">
   <div class="group-header">
     <div><strong>{{$g.Name}}</strong>
-      <span class="hint">{{len $g.Items}} environments · branch <code>{{(index $g.Items 0).Branch}}</code></span></div>
+      <span class="hint">{{len $g.Items}} environments · branch <code>{{(index $g.Items 0).Branch}}</code>{{with (index $g.Items 0).Expiry}} · {{.}}{{end}}</span></div>
     <button class="delete-btn" hx-delete="/environments/{{$g.Name}}" hx-target="#response"
       hx-confirm="Delete group {{$g.Name}} and its {{len $g.Items}} environments?">Delete group</button>
   </div>
@@ -420,7 +426,7 @@ func (m *MockEnvironments) Create(reqs []EnvironmentRequest) (string, error) {
 func (m *MockEnvironments) List() (EnvironmentList, error) {
 	return EnvironmentList{
 		Items: []EnvironmentItem{
-			{ID: "test-env-1", Name: "test-env-1", Status: "Healthy", Sync: "Synced", Branch: "main", EnvType: "dev", URL: envURL("test-env-1")},
+			{ID: "test-env-1", Name: "test-env-1", Status: "Healthy", Sync: "Synced", Branch: "main", EnvType: "dev", URL: envURL("test-env-1"), ExpiresAt: mockExpiry(3*time.Hour + 12*time.Minute)},
 			{ID: "staging-app", Name: "staging-app", Status: "Progressing", Sync: "Synced", Branch: "main", EnvType: "staging", Dependencies: []string{"postgresql"}, URL: envURL("staging-app")},
 			{ID: "demo-service", Name: "demo-service", Status: "Healthy", Sync: "Synced", Branch: "demo", EnvType: "dev", Dependencies: []string{"redis", "mongodb"}, URL: envURL("demo-service")},
 			mockBench("pg-compare", "16", 1180, 6.8), mockBench("pg-compare", "17", 1265, 6.3), mockBench("pg-compare", "18", 0, 0),
@@ -432,8 +438,10 @@ func mockBench(group, version string, tps, latency float64) EnvironmentItem {
 	name := group + "-postgresql-" + version
 	return EnvironmentItem{ID: name, Name: name, Group: group, Status: "Healthy", Sync: "Synced", Branch: "main",
 		Dependencies: []string{"postgresql"}, Versions: map[string]string{"postgresql": version}, URL: envURL(name),
-		Benchmark: &BenchResult{Done: tps > 0, TPS: tps, LatencyMs: latency}}
+		Benchmark: &BenchResult{Done: tps > 0, TPS: tps, LatencyMs: latency}, ExpiresAt: mockExpiry(20 * time.Hour)}
 }
+
+func mockExpiry(in time.Duration) string { return time.Now().Add(in).Format(time.RFC3339) }
 
 func (m *MockEnvironments) Delete(name string) (string, error) {
 	log.Printf("Mock: Deleting environment %s", name)
@@ -469,6 +477,11 @@ func main() {
 			log.Fatalf("bootstrap: %v", err)
 		}
 		log.Printf("GitOps repo: %s (branch %s), root app: %s", repo.URL(), repo.Branch, rootApp)
+		go func() {
+			for range time.Tick(time.Minute) {
+				gitops.ReapExpired(time.Now())
+			}
+		}()
 		envs = gitops
 	}
 

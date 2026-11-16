@@ -23,6 +23,9 @@ UI / API ──commit──► client repo (environments/<name>.json) ◄──w
   that prints its pod name), `deps/` has PostgreSQL, Redis and MongoDB.
 - **Delete** = a commit that removes the file. The root app prunes the `Application`, and its
   `resources-finalizer` makes ArgoCD delete the workloads too.
+- **Expiry**: every environment gets a `meeseeks/expires-at` annotation (default 24h, up to 7 days).
+  Once a minute Meeseeks deletes the expired ones with an `Expire environment …` commit, a whole group at once.
+  Applications without the annotation never expire.
 
 What a request turns into, inside each committed `Application`:
 
@@ -37,6 +40,7 @@ What a request turns into, inside each committed `Application`:
 | `versions` | Kustomize image override per dependency (PostgreSQL 15–18, Redis 7–8, MongoDB 7–8) |
 | `matrix` | One environment per combination, as a group under `environments/<group>/`, in **one commit** |
 | `benchmark` | A pgbench Job per environment; results read from its logs through Argo CD and shown side by side per group |
+| `ttl` | `meeseeks/expires-at` annotation (Go duration, `1m`–`168h`, default `24h`) |
 
 Example: compare PostgreSQL versions on the same branch (shown in the screenshot):
 
@@ -101,7 +105,7 @@ On kind and other clusters use `kubectl port-forward -n env-<name> svc/app 8080:
 ```bash
 curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d '{
   "name": "my-feature", "branch": "main", "env_type": "dev",
-  "cpu": "100m", "memory": "128Mi", "replicas": 2,
+  "cpu": "100m", "memory": "128Mi", "replicas": 2, "ttl": "4h",
   "dependencies": ["postgresql", "redis"],
   "env_vars": {"LOG_LEVEL": "debug"}
 }'                                              # 202 + commit URL
@@ -123,6 +127,8 @@ make docker-run  # run it against the local ArgoCD
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
 - ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.
+- A TTL can't be extended yet; recreate the environment. Expiry is checked by the running Meeseeks,
+  so nothing expires while it is down (it catches up a minute after it starts again).
 - Benchmark numbers are indicative. Every run in a group is concurrent on the same node, and the
   runs start when each Postgres is ready, so they don't overlap exactly. In one run on this setup
   PG 18 started 8 s after the others and ran alone for its last 8 s. A fair comparison needs

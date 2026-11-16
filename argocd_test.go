@@ -3,13 +3,18 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildApplication(t *testing.T) {
 	app := buildApplication(EnvironmentRequest{
 		Name: "x", Branch: "feature/a", CPU: "100m", Replicas: 2,
 		Dependencies: []string{"postgresql"}, EnvVars: map[string]string{"LOG_LEVEL": "debug"},
+		ExpiresAt: time.Date(2026, 11, 15, 18, 0, 0, 0, time.UTC),
 	})
+	if got := app.Metadata.Annotations[expiresAt]; got != "2026-11-15T18:00:00Z" {
+		t.Fatalf("expiry annotation = %q", got)
+	}
 
 	src := app.Spec.Sources
 	if len(src) != 2 || src[0].Path != "deploy/base" || src[1].Path != "deploy/deps/postgresql" {
@@ -46,6 +51,9 @@ func TestValidateRejects(t *testing.T) {
 		"unknown dep":   func(r *EnvironmentRequest) { r.Dependencies = []string{"mysql"} },
 		"duplicate dep": func(r *EnvironmentRequest) { r.Dependencies = []string{"redis", "redis"} },
 		"bad env var":   func(r *EnvironmentRequest) { r.EnvVars = map[string]string{"1-BAD": "x"} },
+		"ttl garbage":   func(r *EnvironmentRequest) { r.TTL = "tomorrow" },
+		"ttl too short": func(r *EnvironmentRequest) { r.TTL = "30s" },
+		"ttl too long":  func(r *EnvironmentRequest) { r.TTL = "200h" },
 	} {
 		req := base
 		mutate(&req)

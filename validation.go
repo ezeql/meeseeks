@@ -6,10 +6,29 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // maxMatrix caps how many environments one request can create.
 const maxMatrix = 8
+
+// Environments expire after defaultTTL unless the request asks for another TTL, up to maxTTL.
+const (
+	defaultTTL = 24 * time.Hour
+	maxTTL     = 7 * 24 * time.Hour
+)
+
+// parseTTL turns the request's ttl into a duration; empty means defaultTTL.
+func parseTTL(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultTTL, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < time.Minute || d > maxTTL {
+		return 0, fmt.Errorf("ttl must be a duration between 1m and 168h, e.g. 4h, got %q", s)
+	}
+	return d, nil
+}
 
 var (
 	nameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
@@ -72,6 +91,10 @@ func ValidateEnvironmentRequest(req EnvironmentRequest) error {
 
 	if req.Benchmark && !slices.Contains(req.Dependencies, "postgresql") && req.Matrix["postgresql"] == nil {
 		return fmt.Errorf("benchmark needs the postgresql dependency")
+	}
+
+	if _, err := parseTTL(req.TTL); err != nil {
+		return err
 	}
 
 	if err := validateEnvType(req.EnvType); err != nil {
