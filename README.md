@@ -60,14 +60,26 @@ curl -X POST localhost:22282/environments -H 'Content-Type: application/json' -d
 - After each commit Meeseeks asks ArgoCD to refresh the root app, so changes land in seconds
   instead of on the ~3 min poll. In production a GitHub webhook to ArgoCD does this.
 
-## Run it locally (OrbStack)
+## Run it locally
 
-Requirements: [OrbStack](https://orbstack.dev) with Kubernetes, OpenTofu or Terraform, the `argocd` and `gh` CLIs, Go 1.24+.
-Argo CD v3.6.1 (Helm chart 10.18.0) is installed by `terraform/`.
+Requirements: Docker, Go 1.24+, `kubectl`, and a GitHub token that can write to your client repo.
 
 ```bash
-cd terraform && tofu init && tofu apply         # ArgoCD on :30080, writes argocd-token.txt
-cd .. && make run                                   # http://localhost:22282
+gh repo create <you>/meeseeks-environments --private --add-readme   # your client repo (needs one commit)
+make up                                                               # kind cluster + Argo CD v3.6.1 on :30080
+make run GITOPS_REPO=https://github.com/<you>/meeseeks-environments   # http://localhost:22282
+make down                                                             # delete the cluster
+```
+
+`make up` runs [kind](https://kind.sigs.k8s.io) through `go run`, so there is nothing else to install. It keeps
+its kubeconfig and the Argo CD API token in `.kind/` and leaves your current `kubectl` context alone
+(`kubectl --kubeconfig .kind/kubeconfig ...` to look inside). While `.kind/` exists, `make run` uses that cluster.
+
+**Existing cluster instead** (e.g. OrbStack): `terraform/` installs Argo CD v3.6.1 (Helm chart 10.18.0) on the
+current context and writes `terraform/argocd-token.txt`, which `make run` picks up when there is no `.kind/`:
+
+```bash
+cd terraform && tofu init && tofu apply         # needs OpenTofu or Terraform and the argocd CLI
 ```
 
 Configuration (environment variables; the Makefile has local defaults):
@@ -77,12 +89,12 @@ Configuration (environment variables; the Makefile has local defaults):
 | `GITOPS_REPO` | `https://github.com/ezeql/meeseeks-environments` | Client repo Meeseeks commits to |
 | `GITOPS_BRANCH` | `main` | Branch of the client repo |
 | `GITHUB_TOKEN` | `gh auth token` | Write access to the client repo; also registered in ArgoCD to read it |
-| `ARGOCD_URL` / `ARGOCD_TOKEN` | `http://localhost:30080` / `terraform/argocd-token.txt` | ArgoCD API |
+| `ARGOCD_URL` / `ARGOCD_TOKEN` | `.kind/env`, else `http://localhost:30080` / `terraform/argocd-token.txt` | ArgoCD API |
 
 Without a cluster, `make dev-mock` serves the UI with fake data.
 
 With OrbStack, each environment is reachable from the Mac at `http://app.env-<name>.svc.cluster.local`.
-On other clusters use `kubectl port-forward -n env-<name> svc/app 8080:80`.
+On kind and other clusters use `kubectl port-forward -n env-<name> svc/app 8080:80`.
 
 ## API
 

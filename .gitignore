@@ -11,3 +11,6 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/tmp/
+
+# local kind cluster (kubeconfig + Argo CD token)
+.kind/
