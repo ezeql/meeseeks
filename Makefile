@@ -104,9 +104,9 @@ up:
 		session=$$(printf '{"username":"admin","password":"%s"}' "$$pass" | curl -sf -H "Content-Type: application/json" $$url/api/v1/session -d @- | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 		[ -n "$$session" ] && break; sleep 2; \
 	done; \
-	token=$$(curl -sf -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $$session" $$url/api/v1/account/admin/token -d '{}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+	token=$$(printf 'Authorization: Bearer %s\n' "$$session" | curl -sf -X POST -H "Content-Type: application/json" -H @- $$url/api/v1/account/admin/token -d '{}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 	[ -n "$$token" ] || { echo "Could not get an Argo CD API token from $$url"; exit 1; }; \
-	printf 'ARGOCD_PORT ?= %s\nARGOCD_URL ?= %s\nARGOCD_TOKEN ?= %s\n' "$(ARGOCD_PORT)" "$$url" "$$token" > .kind/env
+	printf 'ARGOCD_PORT ?= %s\nARGOCD_URL ?= %s\nARGOCD_TOKEN ?= %s\n' "$(ARGOCD_PORT)" "$$url" "$$token" > .kind/env; chmod 600 .kind/env
 	@echo "Argo CD is up at http://localhost:$(ARGOCD_PORT). Next: make run"
 
 # Delete the kind cluster and its token

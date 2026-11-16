@@ -142,7 +142,8 @@ make docker-run  # run it against the local ArgoCD
 
 - The Git writer only supports GitHub (Git Data API).
 - The API, the UI and `/mcp` have no authentication. Meeseeks listens on 127.0.0.1 and rejects browser
-  writes from non-localhost origins (CSRF, DNS rebinding); anything wider needs an authenticating proxy.
+  writes from non-localhost origins (CSRF, DNS rebinding), so the UI only works at `localhost`;
+  curl and MCP clients send no Origin and work wherever `LISTEN_ADDR` exposes the server.
 - Environments run under Argo CD's `default` project. A dedicated AppProject limited to `env-*`
   namespaces would contain a bad branch of the base manifests.
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.

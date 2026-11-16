@@ -35,7 +35,7 @@ var (
 	cpuRegex  = regexp.MustCompile(`^\d+(\.\d+)?[m]?$`)
 	memRegex  = regexp.MustCompile(`^\d+(\.\d+)?[KMGT]i?$`)
 	envRegex  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	shaRegex  = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
+	shaRegex  = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
 )
 
 func ValidateEnvironmentRequest(req EnvironmentRequest) error {

@@ -55,6 +55,7 @@ func TestValidateRejects(t *testing.T) {
 		"pull ref":      func(r *EnvironmentRequest) { r.Branch = "refs/pull/1/head" },
 		"short pull":    func(r *EnvironmentRequest) { r.Branch = "pull/1/head" },
 		"commit sha":    func(r *EnvironmentRequest) { r.Branch = "0123abcd" },
+		"upper sha":     func(r *EnvironmentRequest) { r.Branch = "0123456789ABCDEF0123456789ABCDEF01234567" },
 		"ttl too short": func(r *EnvironmentRequest) { r.TTL = "30s" },
 		"ttl too long":  func(r *EnvironmentRequest) { r.TTL = "200h" },
 	} {

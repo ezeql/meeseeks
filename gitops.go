@@ -299,11 +299,20 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 	return commit, nil
 }
 
-// expired reports whether a committed Application's own expires-at has passed.
-// No annotation, or one that doesn't parse, means it never expires.
-func expired(app ArgoCDApplication, now time.Time) bool {
+// expired reports whether a committed Application's own expires-at has passed. Only the
+// annotations are decoded, so any file Argo CD accepts can expire. No annotation, or one
+// that doesn't parse, means it never expires.
+func expired(content string, now time.Time) (bool, error) {
+	var app struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(content), &app); err != nil {
+		return false, err
+	}
 	t, err := time.Parse(time.RFC3339, app.Metadata.Annotations[expiresAt])
-	return err == nil && !now.Before(t)
+	return err == nil && !now.Before(t), nil
 }
 
 // ReapExpired removes every expired environment in one commit. Argo CD only nominates
@@ -344,8 +353,11 @@ func (g *GitOps) ReapExpired(now time.Time) {
 			log.Printf("reaper: %v", err)
 			continue
 		}
-		var app ArgoCDApplication
-		if json.Unmarshal([]byte(content), &app) == nil && expired(app, now) {
+		ok, err := expired(content, now)
+		if err != nil {
+			log.Printf("reaper: %s: %v", p, err)
+		}
+		if ok {
 			changes[p] = nil
 			names = append(names, strings.TrimSuffix(path.Base(p), ".json"))
 		}

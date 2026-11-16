@@ -362,3 +362,15 @@ func TestReapExpired(t *testing.T) {
 		}
 	}
 }
+
+func TestExpiredReadsOnlyAnnotations(t *testing.T) {
+	// replicas count as a string is valid for Argo CD (IntOrString) but not for ArgoCDApplication.
+	ok, err := expired(`{"metadata":{"annotations":{"meeseeks/expires-at":"2026-01-01T00:00:00Z"}},
+		"spec":{"sources":[{"kustomize":{"replicas":[{"name":"app","count":"2"}]}}]}}`, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("an expired file must expire whatever else it holds: %v %v", ok, err)
+	}
+	if _, err := expired("not json", time.Now()); err == nil {
+		t.Fatal("a file that isn't JSON must report an error (logged by the reaper)")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -520,7 +521,7 @@ func main() {
 	mux.HandleFunc("/mcp", api.mcp)
 
 	port := getenv("PORT", "22282")
-	addr := getenv("LISTEN_ADDR", "127.0.0.1") + ":" + port // no auth: localhost unless told otherwise
+	addr := net.JoinHostPort(getenv("LISTEN_ADDR", "127.0.0.1"), port) // no auth: localhost unless told otherwise
 	log.Printf("Meeseeks API server listening on %s", addr)
 	log.Printf("Frontend available at: http://localhost:%s", port)
 	log.Fatal(http.ListenAndServe(addr, localOnly(mux)))
