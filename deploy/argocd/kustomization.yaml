@@ -1,0 +1,27 @@
+# Argo CD for `make up` (kind). Applied with:
+#   kubectl apply -k deploy/argocd --server-side --force-conflicts
+# Not synced by Argo CD itself; environments only use deploy/base, deploy/deps and deploy/bench.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: argocd
+resources:
+  - https://raw.githubusercontent.com/argoproj/argo-cd/v3.6.1/manifests/install.yaml
+  - namespace.yaml
+  - nodeport.yaml
+patches:
+  # API tokens for admin, which is what Meeseeks authenticates with.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cm
+      data:
+        accounts.admin: apiKey, login
+  # Plain HTTP on the NodePort; only bound to 127.0.0.1 by the kind config.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cmd-params-cm
+      data:
+        server.insecure: "true"

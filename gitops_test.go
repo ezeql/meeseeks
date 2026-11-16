@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeGitHub implements the slice of GitHub's Git Data API that GitHubRepo uses,
@@ -42,6 +45,13 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, map[string]string{"path": path, "type": "blob"})
 		}
 		reply(map[string]any{"tree": entries})
+	case r.Method == "GET" && strings.HasPrefix(p, "contents/"):
+		c, ok := f.files[strings.TrimPrefix(p, "contents/")]
+		if !ok {
+			http.Error(w, "Not Found", 404)
+			return
+		}
+		reply(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(c)), "encoding": "base64"})
 	case r.Method == "POST" && p == "git/trees":
 		next := maps.Clone(f.files)
 		for _, e := range in["tree"].([]any) {
@@ -112,6 +122,10 @@ func TestGitOpsCreateDelete(t *testing.T) {
 	var app ArgoCDApplication
 	if err := json.Unmarshal([]byte(gh.files["environments/feat.json"]), &app); err != nil || app.Metadata.Name != "feat" {
 		t.Fatalf("committed file is not the Application: %v %+v", err, app.Metadata)
+	}
+	if exp, err := time.Parse(time.RFC3339, app.Metadata.Annotations[expiresAt]); err != nil ||
+		time.Until(exp) < defaultTTL-time.Minute || time.Until(exp) > defaultTTL {
+		t.Fatalf("no ttl should mean the default expiry, got %q", app.Metadata.Annotations[expiresAt])
 	}
 	if refreshes != 1 {
 		t.Fatalf("root app should be refreshed after a commit, got %d", refreshes)
@@ -274,5 +288,89 @@ func TestNewGitHubRepoRejectsNonGitHub(t *testing.T) {
 		if _, err := NewGitHubRepo(u, "main", "t"); err == nil {
 			t.Errorf("%q: expected error", u)
 		}
+	}
+}
+
+func TestReapExpired(t *testing.T) {
+	past, future := "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"
+	labels := func(group string) string {
+		l := `"meeseeks/gitops":"true"`
+		if group != "" {
+			l += `,"meeseeks/group":"` + group + `"`
+		}
+		return l
+	}
+	app := func(name, group, expires string) string { // as listed by Argo CD and as committed to Git
+		ann := ""
+		if expires != "" {
+			ann = `,"annotations":{"meeseeks/expires-at":"` + expires + `"}`
+		}
+		return `{"metadata":{"name":"` + name + `","labels":{` + labels(group) + `}` + ann + `}}`
+	}
+
+	// Argo CD's view, which can lag behind Git.
+	listOK := true
+	argoApps := []string{
+		app("old", "", past), app("fresh", "", future), app("forever", "", ""), app("garbled", "", "next tuesday"),
+		app("grp-a", "grp", past), app("grp-b", "grp", future), // members expire on their own
+		app("stale-g-16", "stale-g", past), // group stale-g already left Git; a new single env took the name
+		app("stale-x", "", past),           // single stale-x already left Git; a new group took the name
+		app("kept", "", past),              // expired in Argo CD, but its file in Git no longer has the annotation
+	}
+	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Query().Get("refresh") != "":
+		case r.URL.Path == "/api/v1/applications" && listOK:
+			io.WriteString(w, `{"items":[`+strings.Join(argoApps, ",")+`]}`)
+		default:
+			http.Error(w, "boom", 500)
+		}
+	}))
+	defer argo.Close()
+
+	g, gh := newTestGitOps(t, argo.URL)
+	for path, content := range map[string]string{
+		"old": app("old", "", past), "fresh": app("fresh", "", future),
+		"forever": app("forever", "", ""), "garbled": app("garbled", "", "next tuesday"),
+		"grp/grp-a": app("grp-a", "grp", past), "grp/grp-b": app("grp-b", "grp", future),
+		"stale-g":                  app("stale-g", "", future),
+		"stale-x/stale-x-postgres": app("stale-x-postgres", "stale-x", future),
+		"kept":                     app("kept", "", ""),
+	} {
+		gh.files["environments/"+path+".json"] = content
+	}
+
+	listOK = false
+	g.ReapExpired(time.Now())
+	if len(gh.messages) != 0 {
+		t.Fatalf("a failed list must not delete anything, got %v", gh.messages)
+	}
+
+	listOK = true
+	g.ReapExpired(time.Now())
+	if want := []string{"Expire 2 environments\n\ngrp-a\nold"}; !slices.Equal(gh.messages, want) {
+		t.Fatalf("commits = %q, want %q", gh.messages, want)
+	}
+	for _, f := range []string{"old", "grp/grp-a"} {
+		if _, ok := gh.files["environments/"+f+".json"]; ok {
+			t.Errorf("%s expired in Git and should be gone", f)
+		}
+	}
+	for _, f := range []string{"fresh", "forever", "garbled", "grp/grp-b", "stale-g", "stale-x/stale-x-postgres", "kept"} {
+		if _, ok := gh.files["environments/"+f+".json"]; !ok {
+			t.Errorf("%s must survive: only a file whose own expiry has passed is deleted", f)
+		}
+	}
+}
+
+func TestExpiredReadsOnlyAnnotations(t *testing.T) {
+	// replicas count as a string is valid for Argo CD (IntOrString) but not for ArgoCDApplication.
+	ok, err := expired(`{"metadata":{"annotations":{"meeseeks/expires-at":"2026-01-01T00:00:00Z"}},
+		"spec":{"sources":[{"kustomize":{"replicas":[{"name":"app","count":"2"}]}}]}}`, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("an expired file must expire whatever else it holds: %v %v", ok, err)
+	}
+	if _, err := expired("not json", time.Now()); err == nil {
+		t.Fatal("a file that isn't JSON must report an error (logged by the reaper)")
 	}
 }

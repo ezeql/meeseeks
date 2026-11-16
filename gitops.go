@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,6 +91,18 @@ func (g *GitHubRepo) snapshot() (snapshot, error) {
 		}
 	}
 	return s, nil
+}
+
+// read returns a file's content as of s.
+func (g *GitHubRepo) read(s snapshot, p string) (string, error) {
+	var file struct {
+		Content string `json:"content"`
+	}
+	if err := g.do("GET", "contents/"+p+"?ref="+s.head, nil, &file); err != nil {
+		return "", err
+	}
+	b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(file.Content, "\n", ""))
+	return string(b), err
 }
 
 // commit writes changes (path → content, nil to delete) as one commit on top of s.
@@ -238,9 +251,17 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 		return "", fmt.Errorf("%q is already used in %s", group, g.repo.URL())
 	}
 
+	ttl, err := parseTTL(reqs[0].TTL)
+	if err != nil {
+		return "", err
+	}
+	expires := time.Now().Add(ttl).UTC().Truncate(time.Second) // one expiry for the whole group
+
 	changes := map[string]*string{}
 	var lines []string
-	for _, r := range reqs {
+	for i := range reqs {
+		reqs[i].ExpiresAt = expires
+		r := reqs[i]
 		if used[r.Name] || r.Name == rootApp {
 			return "", fmt.Errorf("%q is already used in %s", r.Name, g.repo.URL())
 		}
@@ -259,11 +280,11 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 		lines = append(lines, "- "+r.Name+": "+depsSummary(r.Dependencies, r.Versions))
 	}
 
-	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s",
-		reqs[0].Name, reqs[0].Branch, reqs[0].EnvType, depsSummary(reqs[0].Dependencies, reqs[0].Versions))
+	msg := fmt.Sprintf("Create environment %s\n\nbranch: %s, type: %s, dependencies: %s, expires: %s",
+		reqs[0].Name, reqs[0].Branch, reqs[0].EnvType, depsSummary(reqs[0].Dependencies, reqs[0].Versions), expires.Format(time.RFC3339))
 	if group != "" {
-		msg = fmt.Sprintf("Create group %s: %d environments\n\nbranch: %s, benchmark: %t\n%s",
-			group, len(reqs), reqs[0].Branch, reqs[0].Benchmark, strings.Join(lines, "\n"))
+		msg = fmt.Sprintf("Create group %s: %d environments\n\nbranch: %s, benchmark: %t, expires: %s\n%s",
+			group, len(reqs), reqs[0].Branch, reqs[0].Benchmark, expires.Format(time.RFC3339), strings.Join(lines, "\n"))
 	}
 	commit, err := g.repo.commit(s, msg, changes)
 	if err != nil {
@@ -276,6 +297,86 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 	g.benchMu.Unlock()
 	g.refresh()
 	return commit, nil
+}
+
+// expired reports whether a committed Application's own expires-at has passed. Only the
+// annotations are decoded, so any file Argo CD accepts can expire. No annotation, or one
+// that doesn't parse, means it never expires.
+func expired(content string, now time.Time) (bool, error) {
+	var app struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(content), &app); err != nil {
+		return false, err
+	}
+	t, err := time.Parse(time.RFC3339, app.Metadata.Annotations[expiresAt])
+	return err == nil && !now.Before(t), nil
+}
+
+// ReapExpired removes every expired environment in one commit. Argo CD only nominates
+// candidates (it can lag behind Git); each one is deleted only if its file is still in Git
+// and the file itself says it has expired.
+func (g *GitOps) ReapExpired(now time.Time) {
+	list, err := g.argo.ListApplications()
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	candidates := map[string]bool{}
+	for _, e := range list.Items {
+		t, err := time.Parse(time.RFC3339, e.ExpiresAt)
+		if err == nil && e.Status != "Deleting" && !now.Before(t) {
+			candidates[envFile(EnvironmentRequest{Name: e.Name, Group: e.Group})] = true
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	s, err := g.repo.snapshot()
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	changes := map[string]*string{}
+	var names []string
+	for _, p := range s.paths {
+		if !candidates[p] {
+			continue
+		}
+		content, err := g.repo.read(s, p)
+		if err != nil {
+			log.Printf("reaper: %v", err)
+			continue
+		}
+		ok, err := expired(content, now)
+		if err != nil {
+			log.Printf("reaper: %s: %v", p, err)
+		}
+		if ok {
+			changes[p] = nil
+			names = append(names, strings.TrimSuffix(path.Base(p), ".json"))
+		}
+	}
+	if len(changes) == 0 {
+		return
+	}
+	slices.Sort(names)
+	msg := "Expire environment " + names[0]
+	if len(names) > 1 {
+		msg = fmt.Sprintf("Expire %d environments\n\n%s", len(names), strings.Join(names, "\n"))
+	}
+	commit, err := g.repo.commit(s, msg, changes)
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	log.Printf("reaper: expired %s in %s", strings.Join(names, ", "), commit)
+	g.refresh()
 }
 
 // Delete removes an environment, or every environment of a group, in one commit.

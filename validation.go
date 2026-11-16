@@ -6,16 +6,36 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // maxMatrix caps how many environments one request can create.
 const maxMatrix = 8
+
+// Environments expire after defaultTTL unless the request asks for another TTL, up to maxTTL.
+const (
+	defaultTTL = 24 * time.Hour
+	maxTTL     = 7 * 24 * time.Hour
+)
+
+// parseTTL turns the request's ttl into a duration; empty means defaultTTL.
+func parseTTL(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultTTL, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < time.Minute || d > maxTTL {
+		return 0, fmt.Errorf("ttl must be a duration between 1m and 168h, e.g. 4h, got %q", s)
+	}
+	return d, nil
+}
 
 var (
 	nameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	cpuRegex  = regexp.MustCompile(`^\d+(\.\d+)?[m]?$`)
 	memRegex  = regexp.MustCompile(`^\d+(\.\d+)?[KMGT]i?$`)
 	envRegex  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	shaRegex  = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
 )
 
 func ValidateEnvironmentRequest(req EnvironmentRequest) error {
@@ -74,6 +94,10 @@ func ValidateEnvironmentRequest(req EnvironmentRequest) error {
 		return fmt.Errorf("benchmark needs the postgresql dependency")
 	}
 
+	if _, err := parseTTL(req.TTL); err != nil {
+		return err
+	}
+
 	if err := validateEnvType(req.EnvType); err != nil {
 		return fmt.Errorf("invalid environment type: %w", err)
 	}
@@ -111,6 +135,12 @@ func validateBranch(branch string) error {
 
 	if len(branch) > 255 {
 		return fmt.Errorf("branch name cannot be longer than 255 characters")
+	}
+
+	// Only branches of the base-manifests repo: a ref like refs/pull/1/head or a commit SHA can
+	// point Argo CD at manifests from someone else's fork.
+	if strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "pull/") || shaRegex.MatchString(branch) {
+		return fmt.Errorf("%q must be a branch name, not a ref or a commit SHA", branch)
 	}
 
 	invalidChars := []string{" ", "\t", "\n", "\r", "~", "^", ":", "?", "*", "[", "\\"}

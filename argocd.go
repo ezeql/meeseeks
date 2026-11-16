@@ -67,10 +67,11 @@ type ArgoCDApplication struct {
 }
 
 type ArgoCDApplicationMetadata struct {
-	Name       string            `json:"name"`
-	Namespace  string            `json:"namespace"`
-	Labels     map[string]string `json:"labels"`
-	Finalizers []string          `json:"finalizers,omitempty"`
+	Name        string            `json:"name"`
+	Namespace   string            `json:"namespace"`
+	Labels      map[string]string `json:"labels"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	Finalizers  []string          `json:"finalizers,omitempty"`
 }
 
 type ArgoCDApplicationSpec struct {
@@ -148,6 +149,27 @@ type EnvironmentItem struct {
 	Benchmark    *BenchResult      `json:"benchmark,omitempty"` // nil when no pgbench was requested
 	URL          string            `json:"url"`
 	GitURL       string            `json:"git_url,omitempty"`
+	ExpiresAt    string            `json:"expires_at,omitempty"` // RFC3339; empty for environments that never expire
+}
+
+// expiresAt is the annotation GitOps.ReapExpired acts on.
+const expiresAt = "meeseeks/expires-at"
+
+// Expiry renders "expires in 3h12m" for the UI, or "" when the environment never expires.
+func (e EnvironmentItem) Expiry() string {
+	t, err := time.Parse(time.RFC3339, e.ExpiresAt)
+	if err != nil {
+		return ""
+	}
+	left := time.Until(t).Round(time.Minute)
+	if left <= 0 {
+		return "expiring now"
+	}
+	s := strings.TrimSuffix(left.String(), "0s") // "3h12m0s" → "3h12m"
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m") // "20h0m" → "20h"
+	}
+	return "expires in " + s
 }
 
 // DepsLabel renders "postgresql 17, redis 8" for the UI.
@@ -298,6 +320,7 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 			Metadata struct {
 				Name              string            `json:"name"`
 				Labels            map[string]string `json:"labels"`
+				Annotations       map[string]string `json:"annotations"`
 				DeletionTimestamp string            `json:"deletionTimestamp"`
 			} `json:"metadata"`
 			Spec struct {
@@ -331,13 +354,14 @@ func (c *ArgoCDClient) ListApplications() (EnvironmentList, error) {
 			continue
 		}
 		env := EnvironmentItem{
-			ID:      app.Metadata.Name,
-			Name:    app.Metadata.Name,
-			Status:  app.Status.Health.Status,
-			Sync:    app.Status.Sync.Status,
-			EnvType: app.Metadata.Labels["env-type"],
-			Group:   app.Metadata.Labels["meeseeks/group"],
-			URL:     envURL(app.Metadata.Name),
+			ID:        app.Metadata.Name,
+			Name:      app.Metadata.Name,
+			Status:    app.Status.Health.Status,
+			Sync:      app.Status.Sync.Status,
+			EnvType:   app.Metadata.Labels["env-type"],
+			Group:     app.Metadata.Labels["meeseeks/group"],
+			URL:       envURL(app.Metadata.Name),
+			ExpiresAt: app.Metadata.Annotations[expiresAt],
 		}
 		if app.Metadata.DeletionTimestamp != "" {
 			env.Status = "Deleting"
@@ -443,14 +467,19 @@ func buildApplication(req EnvironmentRequest) ArgoCDApplication {
 	if req.Group != "" {
 		labels["meeseeks/group"] = req.Group
 	}
+	var annotations map[string]string
+	if !req.ExpiresAt.IsZero() {
+		annotations = map[string]string{expiresAt: req.ExpiresAt.UTC().Format(time.RFC3339)}
+	}
 
 	return ArgoCDApplication{
 		APIVersion: "argoproj.io/v1alpha1",
 		Kind:       "Application",
 		Metadata: ArgoCDApplicationMetadata{
-			Name:      req.Name,
-			Namespace: "argocd",
-			Labels:    labels,
+			Name:        req.Name,
+			Namespace:   "argocd",
+			Labels:      labels,
+			Annotations: annotations,
 			// Removing the file from Git prunes this Application; the finalizer makes
 			// ArgoCD delete its workloads too instead of orphaning them.
 			Finalizers: []string{"resources-finalizer.argocd.argoproj.io"},
