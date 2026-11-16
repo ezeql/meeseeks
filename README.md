@@ -113,6 +113,17 @@ curl localhost:22282/environments               # list with sync/health status
 curl -X DELETE localhost:22282/environments/my-feature   # 202 + commit URL
 ```
 
+## MCP (agents)
+
+`POST /mcp` speaks the Model Context Protocol (Streamable HTTP, stateless), with three tools:
+`create_environment` (same fields as the API), `list_environments` and `delete_environment` (marked destructive,
+so clients ask before calling it). They run the same validation as the API, and changes are still commits:
+an agent can't touch the cluster directly, and anything it does can be reviewed or reverted with `git revert`.
+
+```bash
+claude mcp add --transport http meeseeks http://localhost:22282/mcp
+```
+
 ## Development
 
 ```bash
@@ -124,6 +135,8 @@ make docker-run  # run it against the local ArgoCD
 ## Known limits
 
 - The Git writer only supports GitHub (Git Data API).
+- The API, the UI and `/mcp` have no authentication: run Meeseeks on localhost or behind an
+  authenticating proxy. `/mcp` rejects browser requests from non-localhost origins.
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
 - ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.

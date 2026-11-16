@@ -220,6 +220,10 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 </html>`))
 
 func (api *MeeseeksAPI) serveHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" { // "/" matches every path; clients probing e.g. /.well-known/ need a 404
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	type depOption struct {
 		Name, Label, Default string
@@ -511,6 +515,9 @@ func main() {
 	})
 
 	mux.HandleFunc("/environments/", api.deleteEnvironment)
+
+	// MCP for agents: the same operations and guardrails as the REST API
+	mux.HandleFunc("/mcp", api.mcp)
 
 	port := getenv("PORT", "22282")
 	log.Printf("Meeseeks API server starting on port %s", port)
