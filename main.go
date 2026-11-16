@@ -520,9 +520,10 @@ func main() {
 	mux.HandleFunc("/mcp", api.mcp)
 
 	port := getenv("PORT", "22282")
-	log.Printf("Meeseeks API server starting on port %s", port)
+	addr := getenv("LISTEN_ADDR", "127.0.0.1") + ":" + port // no auth: localhost unless told otherwise
+	log.Printf("Meeseeks API server listening on %s", addr)
 	log.Printf("Frontend available at: http://localhost:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(addr, localOnly(mux)))
 }
 
 func (api *MeeseeksAPI) deleteEnvironment(w http.ResponseWriter, r *http.Request) {

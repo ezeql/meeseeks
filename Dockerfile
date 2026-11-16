@@ -16,6 +16,8 @@ WORKDIR /root/
 
 COPY --from=builder /app/meeseeks .
 
+# Inside the container the port must be reachable; docker-run publishes it on 127.0.0.1 only.
+ENV LISTEN_ADDR=0.0.0.0
 EXPOSE 22282
 
 CMD ["./meeseeks"]

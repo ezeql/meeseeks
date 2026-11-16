@@ -23,9 +23,11 @@ UI / API ──commit──► client repo (environments/<name>.json) ◄──w
   that prints its pod name), `deps/` has PostgreSQL, Redis and MongoDB.
 - **Delete** = a commit that removes the file. The root app prunes the `Application`, and its
   `resources-finalizer` makes ArgoCD delete the workloads too.
-- **Expiry**: every environment gets a `meeseeks/expires-at` annotation (default 24h, up to 7 days).
-  Once a minute Meeseeks deletes the expired ones with an `Expire environment …` commit, a whole group at once.
-  Applications without the annotation never expire.
+- **Expiry**: every environment gets a `meeseeks/expires-at` annotation (default 24h, up to 7 days;
+  a group's members share one). Once a minute Meeseeks deletes the expired ones in one `Expire …` commit.
+  Argo CD only nominates candidates: a file is deleted only if it is still in Git and its own annotation
+  there has passed, so a lagging Argo CD can't take out a newer environment that reused the name.
+  Files without the annotation never expire.
 
 What a request turns into, inside each committed `Application`:
 
@@ -87,7 +89,7 @@ current context and writes `terraform/argocd-token.txt`, which `make run` picks 
 cd terraform && tofu init && tofu apply         # needs OpenTofu or Terraform and the argocd CLI
 ```
 
-Configuration (environment variables; the Makefile has local defaults):
+Configuration (environment variables; the Makefile has local defaults, and exported values override them):
 
 | Variable | Default in `make run` | Purpose |
 |---|---|---|
@@ -95,6 +97,7 @@ Configuration (environment variables; the Makefile has local defaults):
 | `GITOPS_BRANCH` | `main` | Branch of the client repo |
 | `GITHUB_TOKEN` | `gh auth token` | Write access to the client repo; also registered in ArgoCD to read it |
 | `ARGOCD_URL` / `ARGOCD_TOKEN` | `.kind/env`, else `http://localhost:30080` / `terraform/argocd-token.txt` | ArgoCD API |
+| `LISTEN_ADDR` | `127.0.0.1` (`0.0.0.0` in the Docker image) | Interface to listen on |
 
 Without a cluster, `make dev-mock` serves the UI with fake data.
 
@@ -119,7 +122,9 @@ curl -X DELETE localhost:22282/environments/my-feature   # 202 + commit URL
 `POST /mcp` speaks the Model Context Protocol (Streamable HTTP, stateless), with three tools:
 `create_environment` (same fields as the API), `list_environments` and `delete_environment` (marked destructive,
 so clients ask before calling it). They run the same validation as the API, and changes are still commits:
-an agent can't touch the cluster directly, and anything it does can be reviewed or reverted with `git revert`.
+an agent never talks to the cluster, can only pick branches of the base-manifests repo (refs like
+`refs/pull/…` and commit SHAs are rejected, so it can't bring its own manifests), and anything it does
+can be reviewed or reverted with `git revert`.
 
 ```bash
 claude mcp add --transport http meeseeks http://localhost:22282/mcp
@@ -136,8 +141,10 @@ make docker-run  # run it against the local ArgoCD
 ## Known limits
 
 - The Git writer only supports GitHub (Git Data API).
-- The API, the UI and `/mcp` have no authentication: run Meeseeks on localhost or behind an
-  authenticating proxy. `/mcp` rejects browser requests from non-localhost origins.
+- The API, the UI and `/mcp` have no authentication. Meeseeks listens on 127.0.0.1 and rejects browser
+  writes from non-localhost origins (CSRF, DNS rebinding); anything wider needs an authenticating proxy.
+- Environments run under Argo CD's `default` project. A dedicated AppProject limited to `env-*`
+  namespaces would contain a bad branch of the base manifests.
 - Env var values are committed in plain text. Real secrets belong in Sealed Secrets or External Secrets.
 - ArgoCD leaves the `env-<name>` namespace behind after a delete.
 - `env_type` is only a label; it doesn't change sizing.

@@ -7,15 +7,17 @@ BINARY_NAME=meeseeks
 DOCKER_IMAGE=meeseeks
 DOCKER_TAG=latest
 PORT=22282
-ARGOCD_URL=http://localhost:30080
-ARGOCD_TOKEN=$(shell cat terraform/argocd-token.txt 2>/dev/null)
-# Written by `make up`: the kind cluster's ArgoCD URL and token. While it exists, `make run` uses kind.
+# Written by `make up`: the kind cluster's Argo CD port, URL and token. While it exists, `make run` uses kind.
 -include .kind/env
+# Defaults (terraform/OrbStack). Exported variables and command-line values win.
+ARGOCD_PORT ?= 30080
+ARGOCD_URL ?= http://localhost:30080
+ARGOCD_TOKEN ?= $(shell cat terraform/argocd-token.txt 2>/dev/null)
 
 # Local cluster for `make up`: kind through `go run`, so there is nothing else to install.
+# Not `?=`: a generic CLUSTER in the environment must not point `make down` at another cluster.
 KIND = go run sigs.k8s.io/kind@v0.33.0
-CLUSTER ?= meeseeks
-ARGOCD_PORT ?= 30080
+CLUSTER = meeseeks
 KUBECTL = kubectl --kubeconfig .kind/kubeconfig
 
 # GitOps client repo: Meeseeks commits one ArgoCD Application per environment here.
@@ -77,8 +79,8 @@ docker:
 # Run Docker container
 docker-run: docker
 	@echo "Running Docker container..."
-	@docker run --rm -p $(PORT):$(PORT) \
-		-e ARGOCD_URL=http://host.docker.internal:30080 \
+	@docker run --rm -p 127.0.0.1:$(PORT):$(PORT) \
+		-e ARGOCD_URL=http://host.docker.internal:$(ARGOCD_PORT) \
 		-e ARGOCD_TOKEN=${ARGOCD_TOKEN} \
 		-e GITOPS_REPO -e GITOPS_BRANCH -e GITHUB_TOKEN \
 		-e PORT=$(PORT) \
@@ -96,15 +98,15 @@ up:
 	@echo "Installing Argo CD..."
 	@$(KUBECTL) apply -k deploy/argocd --server-side --force-conflicts >/dev/null
 	@$(KUBECTL) -n argocd rollout status deploy/argocd-server --timeout=300s
-	@url=http://localhost:$(ARGOCD_PORT); session=; \
+	@umask 077; url=http://localhost:$(ARGOCD_PORT); session=; \
 	for i in $$(seq 60); do \
 		pass=$$($(KUBECTL) -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d); \
-		session=$$(curl -sf -H "Content-Type: application/json" $$url/api/v1/session -d "{\"username\":\"admin\",\"password\":\"$$pass\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+		session=$$(printf '{"username":"admin","password":"%s"}' "$$pass" | curl -sf -H "Content-Type: application/json" $$url/api/v1/session -d @- | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 		[ -n "$$session" ] && break; sleep 2; \
 	done; \
 	token=$$(curl -sf -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $$session" $$url/api/v1/account/admin/token -d '{}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
 	[ -n "$$token" ] || { echo "Could not get an Argo CD API token from $$url"; exit 1; }; \
-	printf 'ARGOCD_URL=%s\nARGOCD_TOKEN=%s\n' "$$url" "$$token" > .kind/env
+	printf 'ARGOCD_PORT ?= %s\nARGOCD_URL ?= %s\nARGOCD_TOKEN ?= %s\n' "$(ARGOCD_PORT)" "$$url" "$$token" > .kind/env
 	@echo "Argo CD is up at http://localhost:$(ARGOCD_PORT). Next: make run"
 
 # Delete the kind cluster and its token

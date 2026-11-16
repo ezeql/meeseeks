@@ -35,6 +35,7 @@ var (
 	cpuRegex  = regexp.MustCompile(`^\d+(\.\d+)?[m]?$`)
 	memRegex  = regexp.MustCompile(`^\d+(\.\d+)?[KMGT]i?$`)
 	envRegex  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	shaRegex  = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 )
 
 func ValidateEnvironmentRequest(req EnvironmentRequest) error {
@@ -134,6 +135,12 @@ func validateBranch(branch string) error {
 
 	if len(branch) > 255 {
 		return fmt.Errorf("branch name cannot be longer than 255 characters")
+	}
+
+	// Only branches of the base-manifests repo: a ref like refs/pull/1/head or a commit SHA can
+	// point Argo CD at manifests from someone else's fork.
+	if strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "pull/") || shaRegex.MatchString(branch) {
+		return fmt.Errorf("%q must be a branch name, not a ref or a commit SHA", branch)
 	}
 
 	invalidChars := []string{" ", "\t", "\n", "\r", "~", "^", ":", "?", "*", "[", "\\"}

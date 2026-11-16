@@ -16,7 +16,8 @@ import (
 // Agents get the same three operations as the REST API, through the same validation
 // (ExpandRequest) and the same backend, so every change is still a reviewable commit.
 
-var mcpVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26"}
+// Not 2025-03-26: that version requires JSON-RPC batches, which this server doesn't accept.
+var mcpVersions = []string{"2025-11-25", "2025-06-18"}
 
 var errUnknownTool = errors.New("unknown tool")
 
@@ -36,17 +37,24 @@ func writeRPC(w http.ResponseWriter, id json.RawMessage, result any, rpcErr *rpc
 	json.NewEncoder(w).Encode(msg)
 }
 
-// localOrigin guards against DNS rebinding: a browser page may only call /mcp from localhost.
 func localOrigin(origin string) bool {
 	u, err := url.Parse(origin)
 	return err == nil && slices.Contains([]string{"localhost", "127.0.0.1", "::1"}, u.Hostname())
 }
 
+// localOnly rejects cross-site browser writes (CSRF, DNS rebinding): a request other than GET that
+// carries an Origin must come from localhost. Clients that send no Origin (curl, MCP clients) pass.
+func localOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if o := r.Header.Get("Origin"); r.Method != http.MethodGet && r.Method != http.MethodHead && o != "" && !localOrigin(o) {
+			http.Error(w, "Forbidden origin", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 func (api *MeeseeksAPI) mcp(w http.ResponseWriter, r *http.Request) {
-	if o := r.Header.Get("Origin"); o != "" && !localOrigin(o) {
-		http.Error(w, "Forbidden origin", http.StatusForbidden)
-		return
-	}
 	if r.Method != http.MethodPost { // no server-initiated stream (GET) or sessions (DELETE)
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -62,7 +70,7 @@ func (api *MeeseeksAPI) mcp(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, nil, nil, &rpcError{-32700, "parse error"})
 		return
 	}
-	if req.ID == nil { // a notification, e.g. notifications/initialized
+	if req.ID == nil || req.Method == "" { // a notification (e.g. notifications/initialized) or a response
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}

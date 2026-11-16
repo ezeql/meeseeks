@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"cmp"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,6 +91,18 @@ func (g *GitHubRepo) snapshot() (snapshot, error) {
 		}
 	}
 	return s, nil
+}
+
+// read returns a file's content as of s.
+func (g *GitHubRepo) read(s snapshot, p string) (string, error) {
+	var file struct {
+		Content string `json:"content"`
+	}
+	if err := g.do("GET", "contents/"+p+"?ref="+s.head, nil, &file); err != nil {
+		return "", err
+	}
+	b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(file.Content, "\n", ""))
+	return string(b), err
 }
 
 // commit writes changes (path → content, nil to delete) as one commit on top of s.
@@ -287,37 +299,76 @@ func (g *GitOps) Create(reqs []EnvironmentRequest) (string, error) {
 	return commit, nil
 }
 
-// Delete removes an environment, or every environment of a group, in one commit.
-func (g *GitOps) Delete(name string) (string, error) { return g.remove(name, "Delete") }
+// expired reports whether a committed Application's own expires-at has passed.
+// No annotation, or one that doesn't parse, means it never expires.
+func expired(app ArgoCDApplication, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, app.Metadata.Annotations[expiresAt])
+	return err == nil && !now.Before(t)
+}
 
-// ReapExpired removes every environment whose expiry has passed, a whole group at a time.
-// Environments without the annotation, or with one that doesn't parse, never expire.
+// ReapExpired removes every expired environment in one commit. Argo CD only nominates
+// candidates (it can lag behind Git); each one is deleted only if its file is still in Git
+// and the file itself says it has expired.
 func (g *GitOps) ReapExpired(now time.Time) {
 	list, err := g.argo.ListApplications()
 	if err != nil {
 		log.Printf("reaper: %v", err)
 		return
 	}
-	expired := map[string]bool{}
+	candidates := map[string]bool{}
 	for _, e := range list.Items {
 		t, err := time.Parse(time.RFC3339, e.ExpiresAt)
-		if err != nil || e.Status == "Deleting" || now.Before(t) {
+		if err == nil && e.Status != "Deleting" && !now.Before(t) {
+			candidates[envFile(EnvironmentRequest{Name: e.Name, Group: e.Group})] = true
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	s, err := g.repo.snapshot()
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	changes := map[string]*string{}
+	var names []string
+	for _, p := range s.paths {
+		if !candidates[p] {
 			continue
 		}
-		expired[cmp.Or(e.Group, e.Name)] = true
-	}
-	for _, name := range slices.Sorted(maps.Keys(expired)) {
-		commit, err := g.remove(name, "Expire")
+		content, err := g.repo.read(s, p)
 		if err != nil {
-			log.Printf("reaper: %s: %v", name, err)
+			log.Printf("reaper: %v", err)
 			continue
 		}
-		log.Printf("reaper: %s expired, removed in %s", name, commit)
+		var app ArgoCDApplication
+		if json.Unmarshal([]byte(content), &app) == nil && expired(app, now) {
+			changes[p] = nil
+			names = append(names, strings.TrimSuffix(path.Base(p), ".json"))
+		}
 	}
+	if len(changes) == 0 {
+		return
+	}
+	slices.Sort(names)
+	msg := "Expire environment " + names[0]
+	if len(names) > 1 {
+		msg = fmt.Sprintf("Expire %d environments\n\n%s", len(names), strings.Join(names, "\n"))
+	}
+	commit, err := g.repo.commit(s, msg, changes)
+	if err != nil {
+		log.Printf("reaper: %v", err)
+		return
+	}
+	log.Printf("reaper: expired %s in %s", strings.Join(names, ", "), commit)
+	g.refresh()
 }
 
-// remove deletes name (an environment or a group) in one commit; verb starts the commit message.
-func (g *GitOps) remove(name, verb string) (string, error) {
+// Delete removes an environment, or every environment of a group, in one commit.
+func (g *GitOps) Delete(name string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -337,9 +388,9 @@ func (g *GitOps) remove(name, verb string) (string, error) {
 		return "", fmt.Errorf("environment %q not found in %s", name, g.repo.URL())
 	}
 
-	msg := verb + " environment " + name
+	msg := "Delete environment " + name
 	if len(changes) > 1 || strings.HasPrefix(slices.Collect(maps.Keys(changes))[0], "environments/"+name+"/") {
-		msg = fmt.Sprintf("%s group %s: %d environments", verb, name, len(changes))
+		msg = fmt.Sprintf("Delete group %s: %d environments", name, len(changes))
 	}
 	commit, err := g.repo.commit(s, msg, changes)
 	if err != nil {

@@ -52,6 +52,9 @@ func TestValidateRejects(t *testing.T) {
 		"duplicate dep": func(r *EnvironmentRequest) { r.Dependencies = []string{"redis", "redis"} },
 		"bad env var":   func(r *EnvironmentRequest) { r.EnvVars = map[string]string{"1-BAD": "x"} },
 		"ttl garbage":   func(r *EnvironmentRequest) { r.TTL = "tomorrow" },
+		"pull ref":      func(r *EnvironmentRequest) { r.Branch = "refs/pull/1/head" },
+		"short pull":    func(r *EnvironmentRequest) { r.Branch = "pull/1/head" },
+		"commit sha":    func(r *EnvironmentRequest) { r.Branch = "0123abcd" },
 		"ttl too short": func(r *EnvironmentRequest) { r.TTL = "30s" },
 		"ttl too long":  func(r *EnvironmentRequest) { r.TTL = "200h" },
 	} {

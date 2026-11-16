@@ -10,7 +10,7 @@ import (
 
 func TestMCP(t *testing.T) {
 	api := &MeeseeksAPI{envs: &MockEnvironments{}}
-	srv := httptest.NewServer(http.HandlerFunc(api.mcp))
+	srv := httptest.NewServer(localOnly(http.HandlerFunc(api.mcp)))
 	defer srv.Close()
 
 	post := func(origin, body string) (int, map[string]any) {
@@ -75,6 +75,19 @@ func TestMCP(t *testing.T) {
 	if code, _ := post("http://localhost:3000", `{"jsonrpc":"2.0","id":1,"method":"ping"}`); code != 200 {
 		t.Fatalf("localhost origin: status %d", code)
 	}
+	if code, _ := post("", `{"jsonrpc":"2.0","id":7,"result":{}}`); code != http.StatusAccepted {
+		t.Fatalf("a response from the client: status %d, want 202", code)
+	}
+
+	rest := httptest.NewServer(localOnly(http.HandlerFunc(api.createEnvironment)))
+	defer rest.Close()
+	req, _ := http.NewRequest("POST", rest.URL, strings.NewReader(`{"name":"x","branch":"main"}`))
+	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Content-Type", "text/plain") // a "simple" request: no CORS preflight
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-site POST to the REST API must be rejected: %v %v", resp, err)
+	}
+
 	if resp, _ := http.Get(srv.URL); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET: status %d, want 405", resp.StatusCode)
 	}
